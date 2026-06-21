@@ -136,3 +136,9 @@ To prevent this runtime DLL loading error on Windows, the project includes a cus
 * **Running via Cargo**: `cargo run` and `cargo build` will execute successfully out-of-the-box.
 * **Distributing the Binary**: If you copy the `voicecli.exe` binary to another location on your system, you must copy the generated `.dll` and `.zip` files from your `target/release` folder to the same folder as the executable, or ensure the Python installation path is added to your Windows system environment `PATH`:
   * `d:\AGProjects\voicestudio\python-embed`
+
+---
+
+## License
+
+GNU General Public License v3.0
