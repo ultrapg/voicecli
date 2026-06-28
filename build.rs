@@ -5,6 +5,16 @@ use std::path::Path;
 fn main() {
     let mut python_sys_home = String::new();
 
+    // Set PYTHON_SYS_HOME for Linux environments
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "linux" {
+        let embed_dir = Path::new("python-embed");
+        if embed_dir.exists() {
+            if let Ok(abs_path) = embed_dir.canonicalize() {
+                python_sys_home = abs_path.to_string_lossy().to_string();
+            }
+        }
+    }
+
     // Only copy DLLs and runtime files on Windows targets
     if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "windows" {
         if let Ok(out_dir) = env::var("OUT_DIR") {
