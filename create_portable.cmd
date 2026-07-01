@@ -42,7 +42,7 @@ if not exist python-embed (
     echo }>> temp_setup.ps1
     
     echo Write-Host "[*] Installing deep learning packages locally (this may take a few minutes)...">> temp_setup.ps1
-    echo ^& "python-embed\python.exe" -m pip install torch "torchaudio==2.4.1" transformers numpy soundfile accelerate qwen-tts torch-directml --no-warn-script-location>> temp_setup.ps1
+    echo ^& "python-embed\python.exe" -m pip install torch torchaudio transformers numpy soundfile accelerate qwen-tts --no-warn-script-location>> temp_setup.ps1
     echo Write-Host "[+] Isolated Python environment setup complete!">> temp_setup.ps1
 
     powershell -NoProfile -ExecutionPolicy Bypass -File temp_setup.ps1
@@ -82,16 +82,6 @@ if not exist python-embed (
     )
 )
 
-:: Ensure torch-directml and matching torchaudio are installed in python-embed for DirectML GPU acceleration
-python-embed\python.exe -c "import torch_directml; import torchaudio" >nul 2>nul
-if !ERRORLEVEL! neq 0 (
-    echo [*] torch-directml not found in python-embed. Installing torch-directml and torchaudio 2.4.1...
-    python-embed\python.exe -m pip install torch-directml "torchaudio==2.4.1" --no-warn-script-location
-    if !ERRORLEVEL! neq 0 (
-        echo [-] Warning: Failed to install torch-directml/torchaudio. DirectML GPU acceleration will be disabled.
-    )
-)
-
 echo [*] Starting voicecli release build...
 cargo build --release
 if !ERRORLEVEL! neq 0 (
@@ -110,7 +100,6 @@ echo [*] Copying binary and runtime assets...
 copy target\release\voicecli.exe %DIST_DIR%\
 copy target\release\*.dll %DIST_DIR%\
 copy target\release\*.zip %DIST_DIR%\
-copy settings.json %DIST_DIR%\
 
 echo [*] Copying portable Python environment (this may take a moment)...
 xcopy /e /i /q python-embed %DIST_DIR%\python-embed

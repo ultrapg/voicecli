@@ -19,10 +19,5 @@ if exist voicecli-portable.zip (
     del /f /q voicecli-portable.zip
 )
 
-echo [*] Deleting portable deployment directory (deploy)...
-if exist deploy (
-    rd /s /q deploy
-)
-
 echo [+] Cleanup complete! The workspace is now in a pure source-code state and ready for GitHub.
 endlocal

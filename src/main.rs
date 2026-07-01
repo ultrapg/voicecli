@@ -9,10 +9,6 @@ use std::path::Path;
 #[command(author = "Antigravity")]
 #[command(about = "Rust CLI for Qwen3-TTS using embedded Python via PyO3", long_about = None)]
 struct Cli {
-    /// Path to settings JSON configuration file
-    #[arg(long, short, global = true)]
-    settings: Option<String>,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -51,38 +47,6 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-
-    // Resolve the settings JSON file path:
-    let mut settings_path = None;
-
-    if let Some(ref path_str) = cli.settings {
-        let path = Path::new(path_str);
-        if !path.exists() {
-            eprintln!("[-] Error: Settings file '{}' does not exist.", path_str);
-            std::process::exit(1);
-        }
-        settings_path = Some(path_str.clone());
-    } else {
-        // Fallback 1: check if settings.json is in CWD
-        let cwd_settings = Path::new("settings.json");
-        if cwd_settings.exists() && cwd_settings.is_file() {
-            if let Ok(abs_path) = cwd_settings.canonicalize() {
-                settings_path = Some(abs_path.to_string_lossy().to_string());
-            }
-        }
-        
-        // Fallback 2: check if settings.json is next to the running executable
-        if settings_path.is_none() {
-            if let Ok(exe_path) = std::env::current_exe() {
-                if let Some(exe_dir) = exe_path.parent() {
-                    let exe_settings = exe_dir.join("settings.json");
-                    if exe_settings.exists() && exe_settings.is_file() {
-                        settings_path = Some(exe_settings.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    }
 
     // Dynamically resolve PYTHONHOME path to ensure portable operation:
     let mut python_home = None;
@@ -139,11 +103,10 @@ fn main() {
         let code = include_str!("../model.py");
         let module = PyModule::from_code_bound(py, code, "model.py", "model")?;
 
-        let settings_val = settings_path.clone();
         match cli.command {
             Commands::Style { text, prompt, output } => {
                 let func = module.getattr("generate_style")?;
-                func.call1((text, prompt, output, settings_val))?;
+                func.call1((text, prompt, output))?;
             }
             Commands::Clone { text, audio_in, output } => {
                 let path = Path::new(&audio_in);
@@ -152,7 +115,7 @@ fn main() {
                     std::process::exit(1);
                 }
                 let func = module.getattr("generate_clone")?;
-                func.call1((text, audio_in, output, settings_val))?;
+                func.call1((text, audio_in, output))?;
             }
         }
         Ok(())
