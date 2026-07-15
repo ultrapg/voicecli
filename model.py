@@ -1,4 +1,5 @@
 import os
+import json
 import torch
 import soundfile as sf
 from qwen_tts import Qwen3TTSModel
@@ -19,9 +20,34 @@ def get_model(model_name: str):
     if model_name not in cached_models:
         print(f"[*] Loading model: {model_name} ...", flush=True)
         
-        # Check if CUDA is available, else use CPU
+        # Default device: CUDA if available, otherwise CPU
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        dtype = torch.float16
+
+        # Try loading settings from settings.json next to binary/in cwd
+        try:
+            settings_paths = ["settings.json", "../settings.json"]
+            # Also check next to the executable if possible
+            if os.path.exists("/proc/self/exe"):
+                exe_dir = os.path.dirname(os.path.realpath("/proc/self/exe"))
+                settings_paths.append(os.path.join(exe_dir, "settings.json"))
+            
+            for path in settings_paths:
+                if os.path.exists(path):
+                    with open(path, "r") as f:
+                        settings = json.load(f)
+                        if "device" in settings and settings["device"]:
+                            device = settings["device"]
+                        if "dtype" in settings and settings["dtype"]:
+                            if settings["dtype"] == "float32":
+                                dtype = torch.float32
+                            elif settings["dtype"] == "bfloat16":
+                                dtype = torch.bfloat16
+                            elif settings["dtype"] == "float16":
+                                dtype = torch.float16
+                    break
+        except Exception as e:
+            print(f"[*] Note: Could not load settings.json: {e}", flush=True)
         
         print(f"[*] Target device: {device} ({dtype})", flush=True)
         

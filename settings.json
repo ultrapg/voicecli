@@ -2,7 +2,7 @@
   "model_name_style": "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
   "model_name_clone": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
   "device": "cpu",
-  "dtype": "float32",
+  "dtype": "float16",
   "huggingface_cache_dir": null,
   "do_sample": true,
   "temperature": 1.0,

@@ -100,6 +100,7 @@ echo [*] Copying binary and runtime assets...
 copy target\release\voicecli.exe %DIST_DIR%\
 copy target\release\*.dll %DIST_DIR%\
 copy target\release\*.zip %DIST_DIR%\
+copy settings.json %DIST_DIR%\
 
 echo [*] Copying portable Python environment (this may take a moment)...
 xcopy /e /i /q python-embed %DIST_DIR%\python-embed

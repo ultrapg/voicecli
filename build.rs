@@ -57,6 +57,38 @@ fn main() {
                 }
             }
         }
+    } else {
+        // If local python-embed/lib directory exists, prioritize linking against it
+        let local_embed_lib = Path::new("python-embed/lib");
+        if local_embed_lib.exists() && local_embed_lib.is_dir() {
+            if let Ok(abs_lib) = local_embed_lib.canonicalize() {
+                println!("cargo:rustc-link-search=native={}", abs_lib.display());
+            }
+        }
+
+        // On non-Windows targets, query Python for its library config directories and add them to link search path
+        if let Ok(output) = std::process::Command::new("python3")
+            .args(["-c", "import sysconfig; print(sysconfig.get_config_var('LIBPL') or '')"])
+            .output()
+        {
+            if output.status.success() {
+                let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path_str.is_empty() {
+                    println!("cargo:rustc-link-search=native={}", path_str);
+                }
+            }
+        }
+        if let Ok(output) = std::process::Command::new("python3")
+            .args(["-c", "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')"])
+            .output()
+        {
+            if output.status.success() {
+                let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !path_str.is_empty() {
+                    println!("cargo:rustc-link-search=native={}", path_str);
+                }
+            }
+        }
     }
 
     // Pass the discovered Python home directory to main.rs as a compile-time environment variable
