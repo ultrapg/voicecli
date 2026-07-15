@@ -54,7 +54,11 @@ Rust 1.75+ is required to build the project. If not installed, you can get it fr
 ### Windows
 To compile a release binary and package it automatically into a redistributable standalone ZIP file, run the following script in your Command Prompt:
 ```cmd
+# For CPU-only version (under 2GB, default)
 create_portable.cmd
+
+# For GPU-enabled version with Flash Attention support
+create_portable.cmd gpu
 ```
 This batch script will:
 1. Compile `voicecli` in release mode (`cargo build --release`).
@@ -65,7 +69,11 @@ This batch script will:
 ### Linux
 To compile a release binary and package it automatically into a redistributable standalone tarball, run the following script:
 ```bash
+# For CPU-only version (under 2GB, default)
 ./create_portable.sh
+
+# For GPU-enabled version with Flash Attention support
+./create_portable.sh gpu
 ```
 This script will:
 1. Setup a portable standalone Python environment in `python-embed/` (using Python Build Standalone) and install all python dependencies.
