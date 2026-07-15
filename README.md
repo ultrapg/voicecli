@@ -51,6 +51,7 @@ Rust 1.75+ is required to build the project. If not installed, you can get it fr
 
 ## How to Build
 
+### Windows
 To compile a release binary and package it automatically into a redistributable standalone ZIP file, run the following script in your Command Prompt:
 ```cmd
 create_portable.cmd
@@ -58,8 +59,18 @@ create_portable.cmd
 This batch script will:
 1. Compile `voicecli` in release mode (`cargo build --release`).
 2. Gather the compiled executable (`voicecli.exe`), required DLLs (`python311.dll`, `vcruntime140.dll`, etc.), standard library ZIPs (`python311.zip`), and the `python-embed/` runtime folder into a staging directory.
-3. Compress the folder into a single standalone archive: **`voicecli-portable.zip`**.
+3. Compress the folder into a single standalone archive: **`deploy/voicecli.zip`**.
 4. Clean up the temporary staging directory.
+
+### Linux
+To compile a release binary and package it automatically into a redistributable standalone tarball, run the following script:
+```bash
+./create_portable.sh
+```
+This script will:
+1. Setup a portable standalone Python environment in `python-embed/` (using Python Build Standalone) and install all python dependencies.
+2. Compile `voicecli` in release mode (`cargo build --release`).
+3. Package the executable `voicecli` and the isolated `python-embed/` environment into a single standalone archive: **`deploy/voicecli.tar.gz`**.
 
 
 ## Usage
