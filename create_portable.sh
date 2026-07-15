@@ -1,6 +1,13 @@
 #!/bin/bash
 set -e
 
+# Check for GPU flag
+USE_GPU=false
+if [ "$1" == "gpu" ]; then
+    USE_GPU=true
+    echo "[*] GPU mode enabled. Will install CUDA-enabled PyTorch and flash-attn."
+fi
+
 # Check if the full environment needs to be bootstrapped
 if [ ! -d "python-embed" ]; then
     echo "[*] python-embed not found. Bootstrapping portable Python environment..."
@@ -28,7 +35,21 @@ if [ ! -d "python-embed" ]; then
     mkdir -p .pip_tmp
     export TMPDIR="$(pwd)/.pip_tmp"
     export PIP_CACHE_DIR="$(pwd)/.pip_cache"
-    ./python-embed/bin/python3 -m pip install torch torchaudio transformers numpy soundfile accelerate qwen-tts
+    
+    if [ "$USE_GPU" = true ]; then
+        echo "[*] Installing CUDA-enabled PyTorch..."
+        ./python-embed/bin/python3 -m pip install torch torchaudio
+        echo "[*] Installing flash-attn (this may take a few minutes)..."
+        ./python-embed/bin/python3 -m pip install flash-attn --no-build-isolation || echo "[-] Warning: flash-attn installation failed, proceeding without it."
+    else
+        echo "[*] Installing CPU-only PyTorch..."
+        ./python-embed/bin/python3 -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+    fi
+    
+    ./python-embed/bin/python3 -m pip install transformers numpy soundfile accelerate qwen-tts
+    
+    echo "[*] Cleaning up python-embed to minimize size..."
+    find python-embed -type d -name "__pycache__" -exec rm -rf {} + || true
     rm -rf .pip_tmp .pip_cache
     echo "[+] Isolated Python environment setup complete!"
 fi

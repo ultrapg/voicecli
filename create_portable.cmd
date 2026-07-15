@@ -1,6 +1,12 @@
 @echo off
 setlocal enabledelayedexpansion
 
+set USE_GPU=false
+if "%1"=="gpu" (
+    set USE_GPU=true
+    echo [*] GPU mode enabled. Will install CUDA-enabled PyTorch and flash-attn.
+)
+
 :: Check if the full environment needs to be bootstrapped
 if not exist python-embed (
     echo [*] python-embed not found. Bootstrapping portable Python environment...
@@ -41,8 +47,16 @@ if not exist python-embed (
     echo     ^(Get-Content $pth^) -replace '#import site', 'import site' ^| Set-Content $pth>> temp_setup.ps1
     echo }>> temp_setup.ps1
     
-    echo Write-Host "[*] Installing deep learning packages locally (this may take a few minutes)...">> temp_setup.ps1
-    echo ^& "python-embed\python.exe" -m pip install torch torchaudio transformers numpy soundfile accelerate qwen-tts --no-warn-script-location>> temp_setup.ps1
+    if "!USE_GPU!"=="true" (
+        echo Write-Host "[*] Installing CUDA-enabled PyTorch and flash-attn...">> temp_setup.ps1
+        echo ^& "python-embed\python.exe" -m pip install torch torchaudio --no-warn-script-location>> temp_setup.ps1
+        echo ^& "python-embed\python.exe" -m pip install flash-attn --no-build-isolation --no-warn-script-location>> temp_setup.ps1
+    ) else (
+        echo Write-Host "[*] Installing CPU-only PyTorch...">> temp_setup.ps1
+        echo ^& "python-embed\python.exe" -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu --no-warn-script-location>> temp_setup.ps1
+    )
+    echo Write-Host "[*] Installing other deep learning packages...">> temp_setup.ps1
+    echo ^& "python-embed\python.exe" -m pip install transformers numpy soundfile accelerate qwen-tts --no-warn-script-location>> temp_setup.ps1
     echo Write-Host "[+] Isolated Python environment setup complete!">> temp_setup.ps1
 
     powershell -NoProfile -ExecutionPolicy Bypass -File temp_setup.ps1
