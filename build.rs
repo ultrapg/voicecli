@@ -57,43 +57,32 @@ fn main() {
                 }
             }
         }
-    } else {
-        // If local python-embed/lib directory exists, prioritize linking against it
-        let local_embed_lib = Path::new("python-embed/lib");
-        if local_embed_lib.exists() && local_embed_lib.is_dir() {
-            if let Ok(abs_lib) = local_embed_lib.canonicalize() {
-                println!("cargo:rustc-link-search=native={}", abs_lib.display());
-            }
-        }
-
-        // On non-Windows targets, query Python for its library config directories and add them to link search path
-        if let Ok(output) = std::process::Command::new("python3")
-            .args(["-c", "import sysconfig; print(sysconfig.get_config_var('LIBPL') or '')"])
-            .output()
-        {
-            if output.status.success() {
-                let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path_str.is_empty() {
-                    println!("cargo:rustc-link-search=native={}", path_str);
-                }
-            }
-        }
-        if let Ok(output) = std::process::Command::new("python3")
-            .args(["-c", "import sysconfig; print(sysconfig.get_config_var('LIBDIR') or '')"])
-            .output()
-        {
-            if output.status.success() {
-                let path_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path_str.is_empty() {
-                    println!("cargo:rustc-link-search=native={}", path_str);
-                }
-            }
-        }
     }
 
     // Pass the discovered Python home directory to main.rs as a compile-time environment variable
     println!("cargo:rustc-env=PYTHON_SYS_HOME={}", python_sys_home);
 
-    // Ensure Cargo rebuilds if build.rs is modified
+    if env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "linux" {
+        let local_embed_lib = Path::new("python-embed/lib");
+        if local_embed_lib.exists() && local_embed_lib.is_dir() {
+            if let Ok(abs_lib) = local_embed_lib.canonicalize() {
+                println!("cargo:rustc-link-search=native={}", abs_lib.display());
+            }
+        } else {
+            if let Ok(out_dir) = env::var("OUT_DIR") {
+                let link_dir = Path::new(&out_dir).join("python-link");
+                let _ = fs::create_dir_all(&link_dir);
+                let target_so = link_dir.join("libpython3.14.so");
+                if !target_so.exists() {
+                    let _ = std::os::unix::fs::symlink("/usr/lib/x86_64-linux-gnu/libpython3.14.so.1.0", &target_so);
+                }
+                println!("cargo:rustc-link-search=native={}", link_dir.display());
+            }
+        }
+    }
+
+    // Ensure Cargo rebuilds if build.rs or python-embed changes
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=python-embed");
+    println!("cargo:rerun-if-changed=python-embed/lib");
 }

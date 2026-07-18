@@ -1,5 +1,4 @@
 import os
-import json
 import torch
 import soundfile as sf
 from qwen_tts import Qwen3TTSModel
@@ -20,34 +19,9 @@ def get_model(model_name: str):
     if model_name not in cached_models:
         print(f"[*] Loading model: {model_name} ...", flush=True)
         
-        # Default device: CUDA if available, otherwise CPU
+        # Check if CUDA is available, else use CPU
         device = "cuda:0" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16
-
-        # Try loading settings from settings.json next to binary/in cwd
-        try:
-            settings_paths = ["settings.json", "../settings.json"]
-            # Also check next to the executable if possible
-            if os.path.exists("/proc/self/exe"):
-                exe_dir = os.path.dirname(os.path.realpath("/proc/self/exe"))
-                settings_paths.append(os.path.join(exe_dir, "settings.json"))
-            
-            for path in settings_paths:
-                if os.path.exists(path):
-                    with open(path, "r") as f:
-                        settings = json.load(f)
-                        if "device" in settings and settings["device"]:
-                            device = settings["device"]
-                        if "dtype" in settings and settings["dtype"]:
-                            if settings["dtype"] == "float32":
-                                dtype = torch.float32
-                            elif settings["dtype"] == "bfloat16":
-                                dtype = torch.bfloat16
-                            elif settings["dtype"] == "float16":
-                                dtype = torch.float16
-                    break
-        except Exception as e:
-            print(f"[*] Note: Could not load settings.json: {e}", flush=True)
+        dtype = torch.float16 if torch.cuda.is_available() else torch.bfloat16
         
         print(f"[*] Target device: {device} ({dtype})", flush=True)
         
@@ -119,3 +93,50 @@ def generate_clone(text: str, audio_path: str, output_path: str):
     except Exception as e:
         print(f"[-] Error in generate_clone: {e}", flush=True)
         raise
+
+# Custom JSON-driven unified interface functions
+current_clone_prompt = None
+
+def prepare_model(mode: str, voice_input: str):
+    """
+    Loads and caches the model once, and extracts the voice cloning prompt (x-vector) if in cloning mode.
+    """
+    global current_clone_prompt
+    if mode == "synthetic":
+        get_model(model_name_style)
+    elif mode == "clone":
+        model = get_model(model_name_clone)
+        if not os.path.exists(voice_input):
+            raise FileNotFoundError(f"Reference audio file not found: {voice_input}")
+        print("[*] Creating voice clone prompt...", flush=True)
+        current_clone_prompt = model.create_voice_clone_prompt(
+            ref_audio=voice_input,
+            x_vector_only_mode=True
+        )
+
+def generate_segment(mode: str, text: str, voice_input: str):
+    """
+    Generates a single segment of audio.
+    Returns (samples: list[float], sample_rate: int)
+    """
+    global current_clone_prompt
+    if mode == "synthetic":
+        model = get_model(model_name_style)
+        print(f"[*] Running inference for synthetic segment: \"{text}\"", flush=True)
+        wavs, sr = model.generate_voice_design(text=text, instruct=voice_input)
+    elif mode == "clone":
+        model = get_model(model_name_clone)
+        if current_clone_prompt is None:
+            if not os.path.exists(voice_input):
+                raise FileNotFoundError(f"Reference audio file not found: {voice_input}")
+            print("[*] Creating voice clone prompt (lazy)...", flush=True)
+            current_clone_prompt = model.create_voice_clone_prompt(
+                ref_audio=voice_input,
+                x_vector_only_mode=True
+            )
+        print(f"[*] Running inference for clone segment: \"{text}\"", flush=True)
+        wavs, sr = model.generate_voice_clone(text=text, voice_clone_prompt=current_clone_prompt)
+    else:
+        raise ValueError(f"Invalid mode: {mode}")
+    
+    return wavs[0].tolist(), int(sr)
