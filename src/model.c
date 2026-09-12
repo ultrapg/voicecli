@@ -389,3 +389,292 @@ void c_generate_clone(const char* text, const char* audio_path, const char* outp
     qwen3_tts_free_result(result);
     qwen3_tts_free(ctx);
 }
+
+void c_generate_style_chunked(const char** chunks, int num_chunks, const char* prompt, const char* output_path) {
+    if (!chunks || num_chunks <= 0) return;
+
+    char model_name[256];
+    get_setting_string("model_name_style", model_name, sizeof(model_name), "qwen-talker-1.7b-voicedesign-BF16.gguf");
+
+    printf("[*] [Auto-Chunk] Loading model: %s (FP16/BF16) ...\n", model_name);
+    printf("[*] Target device: CPU (In-Process Native C++ / GGML FP16 SIMD)\n");
+
+    const char* model_dir = resolve_model_dir();
+    char tok_name[256];
+    get_setting_string("tokenizer_model", tok_name, sizeof(tok_name), "qwen-tokenizer-12hz-BF16.gguf");
+
+    ensure_file_exists(model_dir, tok_name);
+    ensure_file_exists(model_dir, model_name);
+
+    qwen3_tts_context_t* ctx = qwen3_tts_init();
+    if (!ctx) {
+        fprintf(stderr, "[-] Error: Failed to initialize native Qwen3-TTS context\n");
+        return;
+    }
+
+    printf("[*] Loading model weights into memory...\n");
+    fflush(stdout);
+
+    if (!qwen3_tts_load_models_with_name(ctx, model_dir, model_name)) {
+        fprintf(stderr, "[-] Error: Failed to load models '%s' from '%s'\n", model_name, model_dir);
+        qwen3_tts_free(ctx);
+        return;
+    }
+    printf("[+] Model loaded successfully. Processing %d chunks in memory...\n", num_chunks);
+
+    size_t total_samples = 0;
+    size_t audio_capacity = 24000 * 60; // 1 minute initial capacity
+    float* full_audio = (float*)malloc(audio_capacity * sizeof(float));
+    if (!full_audio) {
+        fprintf(stderr, "[-] Error: Failed to allocate audio buffer\n");
+        qwen3_tts_free(ctx);
+        return;
+    }
+    int sample_rate = 24000;
+
+    for (int i = 0; i < num_chunks; i++) {
+        char preview[64];
+        strncpy(preview, chunks[i], sizeof(preview) - 4);
+        preview[sizeof(preview) - 4] = '\0';
+        if (strlen(chunks[i]) > sizeof(preview) - 4) {
+            strcat(preview, "...");
+        }
+        for (int c = 0; preview[c]; c++) {
+            if (preview[c] == '\n' || preview[c] == '\r') preview[c] = ' ';
+        }
+
+        printf("\n[*] Chunk [%d/%d] (%zu chars): \"%s\"\n", i + 1, num_chunks, strlen(chunks[i]), preview);
+        fflush(stdout);
+
+        tts_progress_t prog;
+        prog.is_tty = isatty(fileno(stderr));
+        prog.last_tokens = 0;
+        int text_len = (int)strlen(chunks[i]);
+        prog.estimated_frames = (int)(text_len * 1.0f);
+        if (prog.estimated_frames < 24) prog.estimated_frames = 24;
+
+        qwen3_tts_set_progress_callback(ctx, on_progress, &prog);
+
+        qwen3_tts_params_t params;
+        memset(&params, 0, sizeof(params));
+        params.max_audio_tokens = 4096;
+        params.temperature = 0.9f;
+        params.top_p = 1.0f;
+        params.top_k = 50;
+        params.n_threads = 0;
+        params.print_progress = 0;
+        params.print_timing = 0;
+        params.repetition_penalty = 1.05f;
+        params.instruction = (prompt && strlen(prompt) > 0) ? prompt : NULL;
+
+        qwen3_tts_result_t result = qwen3_tts_synthesize(ctx, chunks[i], params);
+        if (!result.success || result.audio_len <= 0) {
+            if (prog.is_tty) fprintf(stderr, "\r\033[K");
+            fprintf(stderr, "[-] Warning: Chunk %d synthesis failed: %s\n", i + 1,
+                    result.error_msg ? result.error_msg : "unknown error");
+            qwen3_tts_free_result(result);
+            continue;
+        }
+
+        sample_rate = result.sample_rate;
+        double chunk_sec = (double)result.audio_len / (double)result.sample_rate;
+        double wall_sec = (double)result.t_total_ms / 1000.0;
+        double rtf = wall_sec > 0.0 ? chunk_sec / wall_sec : 0.0;
+        if (prog.is_tty) {
+            fprintf(stderr, "\r\033[K[+] Chunk [%d/%d] synthesized: %.2fs audio (%.2fx real-time)\n",
+                    i + 1, num_chunks, chunk_sec, rtf);
+        } else {
+            fprintf(stderr, "[+] Chunk [%d/%d] synthesized: %.2fs audio (%.2fx real-time)\n",
+                    i + 1, num_chunks, chunk_sec, rtf);
+        }
+
+        int silence_samples = (i < num_chunks - 1) ? (int)(sample_rate * 0.25f) : 0;
+        size_t needed = total_samples + result.audio_len + silence_samples;
+        if (needed > audio_capacity) {
+            audio_capacity = needed * 2;
+            float* new_buf = (float*)realloc(full_audio, audio_capacity * sizeof(float));
+            if (!new_buf) {
+                fprintf(stderr, "[-] Error: Failed to reallocate audio buffer\n");
+                qwen3_tts_free_result(result);
+                break;
+            }
+            full_audio = new_buf;
+        }
+
+        memcpy(full_audio + total_samples, result.audio, result.audio_len * sizeof(float));
+        total_samples += result.audio_len;
+
+        if (silence_samples > 0) {
+            memset(full_audio + total_samples, 0, silence_samples * sizeof(float));
+            total_samples += silence_samples;
+        }
+
+        qwen3_tts_free_result(result);
+    }
+
+    if (total_samples > 0) {
+        double total_audio_sec = (double)total_samples / (double)sample_rate;
+        printf("\n============================================================\n");
+        printf("[+] All %d chunks synthesized successfully!\n", num_chunks);
+        printf("[+] Total stitched audio duration: %.2fs (~%.1f min)\n",
+               total_audio_sec, total_audio_sec / 60.0);
+        printf("[*] Saving combined audio to %s (Sample Rate: %d Hz)...\n", output_path, sample_rate);
+        if (save_wav_file(output_path, full_audio, (int)total_samples, sample_rate) == 0) {
+            printf("[+] Audio generation complete!\n");
+        } else {
+            fprintf(stderr, "[-] Error: Failed to write audio file %s\n", output_path);
+        }
+        printf("============================================================\n");
+    } else {
+        fprintf(stderr, "[-] Error: No audio samples were generated.\n");
+    }
+
+    free(full_audio);
+    qwen3_tts_free(ctx);
+}
+
+void c_generate_clone_chunked(const char** chunks, int num_chunks, const char* audio_path, const char* output_path) {
+    if (!chunks || num_chunks <= 0) return;
+
+    char model_name[256];
+    get_setting_string("model_name_clone", model_name, sizeof(model_name), "qwen-talker-1.7b-base-BF16.gguf");
+
+    printf("[*] [Auto-Chunk] Loading model: %s (FP16/BF16) ...\n", model_name);
+    printf("[*] Target device: CPU (In-Process Native C++ / GGML FP16 SIMD)\n");
+
+    const char* model_dir = resolve_model_dir();
+    char tok_name[256];
+    get_setting_string("tokenizer_model", tok_name, sizeof(tok_name), "qwen-tokenizer-12hz-BF16.gguf");
+
+    ensure_file_exists(model_dir, tok_name);
+    ensure_file_exists(model_dir, model_name);
+
+    qwen3_tts_context_t* ctx = qwen3_tts_init();
+    if (!ctx) {
+        fprintf(stderr, "[-] Error: Failed to initialize native Qwen3-TTS context\n");
+        return;
+    }
+
+    printf("[*] Loading model weights into memory...\n");
+    fflush(stdout);
+
+    if (!qwen3_tts_load_models_with_name(ctx, model_dir, model_name)) {
+        fprintf(stderr, "[-] Error: Failed to load models '%s' from '%s'\n", model_name, model_dir);
+        qwen3_tts_free(ctx);
+        return;
+    }
+    printf("[+] Model loaded successfully. Processing %d chunks in memory...\n", num_chunks);
+
+    printf("[*] Cloning voice from reference audio: %s\n", audio_path);
+    printf("[*] Extracting speaker embedding...\n");
+    fflush(stdout);
+
+    size_t total_samples = 0;
+    size_t audio_capacity = 24000 * 60;
+    float* full_audio = (float*)malloc(audio_capacity * sizeof(float));
+    if (!full_audio) {
+        fprintf(stderr, "[-] Error: Failed to allocate audio buffer\n");
+        qwen3_tts_free(ctx);
+        return;
+    }
+    int sample_rate = 24000;
+
+    for (int i = 0; i < num_chunks; i++) {
+        char preview[64];
+        strncpy(preview, chunks[i], sizeof(preview) - 4);
+        preview[sizeof(preview) - 4] = '\0';
+        if (strlen(chunks[i]) > sizeof(preview) - 4) {
+            strcat(preview, "...");
+        }
+        for (int c = 0; preview[c]; c++) {
+            if (preview[c] == '\n' || preview[c] == '\r') preview[c] = ' ';
+        }
+
+        printf("\n[*] Chunk [%d/%d] (%zu chars): \"%s\"\n", i + 1, num_chunks, strlen(chunks[i]), preview);
+        fflush(stdout);
+
+        tts_progress_t prog;
+        prog.is_tty = isatty(fileno(stderr));
+        prog.last_tokens = 0;
+        int text_len = (int)strlen(chunks[i]);
+        prog.estimated_frames = (int)(text_len * 1.0f);
+        if (prog.estimated_frames < 24) prog.estimated_frames = 24;
+
+        qwen3_tts_set_progress_callback(ctx, on_progress, &prog);
+
+        qwen3_tts_params_t params;
+        memset(&params, 0, sizeof(params));
+        params.max_audio_tokens = 4096;
+        params.temperature = 0.9f;
+        params.top_p = 1.0f;
+        params.top_k = 50;
+        params.n_threads = 0;
+        params.print_progress = 0;
+        params.print_timing = 0;
+        params.repetition_penalty = 1.05f;
+
+        qwen3_tts_result_t result = qwen3_tts_synthesize_with_voice(ctx, chunks[i], audio_path, params);
+        if (!result.success || result.audio_len <= 0) {
+            if (prog.is_tty) fprintf(stderr, "\r\033[K");
+            fprintf(stderr, "[-] Warning: Chunk %d voice cloning failed: %s\n", i + 1,
+                    result.error_msg ? result.error_msg : "unknown error");
+            qwen3_tts_free_result(result);
+            continue;
+        }
+
+        sample_rate = result.sample_rate;
+        double chunk_sec = (double)result.audio_len / (double)result.sample_rate;
+        double wall_sec = (double)result.t_total_ms / 1000.0;
+        double rtf = wall_sec > 0.0 ? chunk_sec / wall_sec : 0.0;
+        if (prog.is_tty) {
+            fprintf(stderr, "\r\033[K[+] Chunk [%d/%d] synthesized: %.2fs audio (%.2fx real-time)\n",
+                    i + 1, num_chunks, chunk_sec, rtf);
+        } else {
+            fprintf(stderr, "[+] Chunk [%d/%d] synthesized: %.2fs audio (%.2fx real-time)\n",
+                    i + 1, num_chunks, chunk_sec, rtf);
+        }
+
+        int silence_samples = (i < num_chunks - 1) ? (int)(sample_rate * 0.25f) : 0;
+        size_t needed = total_samples + result.audio_len + silence_samples;
+        if (needed > audio_capacity) {
+            audio_capacity = needed * 2;
+            float* new_buf = (float*)realloc(full_audio, audio_capacity * sizeof(float));
+            if (!new_buf) {
+                fprintf(stderr, "[-] Error: Failed to reallocate audio buffer\n");
+                qwen3_tts_free_result(result);
+                break;
+            }
+            full_audio = new_buf;
+        }
+
+        memcpy(full_audio + total_samples, result.audio, result.audio_len * sizeof(float));
+        total_samples += result.audio_len;
+
+        if (silence_samples > 0) {
+            memset(full_audio + total_samples, 0, silence_samples * sizeof(float));
+            total_samples += silence_samples;
+        }
+
+        qwen3_tts_free_result(result);
+    }
+
+    if (total_samples > 0) {
+        double total_audio_sec = (double)total_samples / (double)sample_rate;
+        printf("\n============================================================\n");
+        printf("[+] All %d chunks synthesized successfully!\n", num_chunks);
+        printf("[+] Total stitched audio duration: %.2fs (~%.1f min)\n",
+               total_audio_sec, total_audio_sec / 60.0);
+        printf("[*] Saving combined audio to %s (Sample Rate: %d Hz)...\n", output_path, sample_rate);
+        if (save_wav_file(output_path, full_audio, (int)total_samples, sample_rate) == 0) {
+            printf("[+] Audio generation complete!\n");
+        } else {
+            fprintf(stderr, "[-] Error: Failed to write audio file %s\n", output_path);
+        }
+        printf("============================================================\n");
+    } else {
+        fprintf(stderr, "[-] Error: No audio samples were generated.\n");
+    }
+
+    free(full_audio);
+    qwen3_tts_free(ctx);
+}
