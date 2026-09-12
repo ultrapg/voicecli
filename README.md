@@ -1,158 +1,384 @@
-# voicecli - Standalone Qwen3-TTS Rust CLI
+# voicecli
 
-`voicecli` is a lightweight, standalone Command Line Interface (CLI) application written in Rust that interfaces with the **Qwen3-TTS** model series using an embedded Python interpreter. It allows you to generate speech from text using natural language description prompts (Voice Design) or clone a voice from a short reference audio clip (Voice Cloning).
+> **Ultra-Fast, Native Single-Binary Qwen3-TTS CLI (Rust + C/C++ GGML Engine)**  
+> High-performance speech synthesis and zero-shot voice cloning with **zero Python dependencies**, full FP16/BF16 neural audio fidelity, in-process SIMD acceleration, and an interactive real-time progress terminal UI.
 
-This version introduces the **`custom`** subcommand, enabling structured multi-segment speech generation with fine-grained style, speed, and pause controls via a unified JSON interface. The existing `style` and `clone` commands serve as aliases/wrappers that generate the JSON internally and route through the same unified pipeline.
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/Platform-Linux%20x86__64-orange.svg)](#system-requirements)
+[![Engine](https://img.shields.io/badge/Engine-GGML%20Native%20C%2B%2B-green.svg)](#architecture-overview)
+[![Python Free](https://img.shields.io/badge/Python-0%25%20(Completely%20Removed)-brightgreen.svg)](#the-re-engineering-python--pytorch-vs-native-ggml)
+
+---
+
+## Table of Contents
+
+- [Overview](#overview)
+- [The Re-Engineering: Python / PyTorch vs. Native GGML](#the-re-engineering-python--pytorch-vs-native-ggml)
+- [Architecture Overview](#architecture-overview)
+- [Key Features](#key-features)
+- [Quick Start: Standalone Portable Bundle](#quick-start-standalone-portable-bundle)
+- [CLI Usage & Command Reference](#cli-usage--command-reference)
+  - [1. Voice Design / Acoustic Style (`voicecli style`)](#1-voice-design--acoustic-style-voicecli-style)
+  - [2. Zero-Shot Voice Cloning (`voicecli clone`)](#2-zero-shot-voice-cloning-voicecli-clone)
+- [Configuration & Settings](#configuration--settings)
+  - [Configuration File (`settings.json`)](#configuration-file-settingsjson)
+  - [Environment Variables](#environment-variables)
+- [Supported Models (GGUF BF16)](#supported-models-gguf-bf16)
+- [Building from Source](#building-from-source)
+  - [Prerequisites](#prerequisites)
+  - [Compiling the Unified Binary](#compiling-the-unified-binary)
+  - [Generating the Portable `.tar.gz` Package](#generating-the-portable-targz-package)
+- [Technical Specifications & Audio Pipeline](#technical-specifications--audio-pipeline)
+- [Troubleshooting & FAQ](#troubleshooting--faq)
+- [License & Acknowledgments](#license--acknowledgments)
+
+---
+
+## Overview
+
+`voicecli` is a high-performance command-line interface for **Qwen3-TTS**, Alibaba Cloud's state-of-the-art text-to-speech and voice-cloning model family.
+
+Earlier implementations of `voicecli` relied on an embedded Python runtime, PyTorch, Hugging Face `transformers`, and CUDA/C++ shared libraries wrapped through PyO3. While functional, that architecture required multi-gigabyte environments, suffered from high cold-start latency (importing PyTorch and CUDA runtimes took 10–20 seconds before generating a single audio sample), consumed massive RAM/VRAM, and was fragile to distribute.
+
+**This release completely replaces `https://github.com/ultrapg/voicecli` with a 100% native single-binary engine.**  
+The entire PyTorch and Python stack has been eliminated. The inference core is built directly on native C/C++ utilizing **GGML** tensor primitives with hardware-accelerated SIMD instructions (AVX2, AVX512, FMA, NEON). The result is a single, self-contained executable under 4 MB (1.6 MB compressed) that can run anywhere on Linux x86_64 without installing Python or deep learning frameworks.
+
+---
+
+## The Re-Engineering: Python / PyTorch vs. Native GGML
+
+| Metric / Feature | Original Python / PyTorch Implementation | New Native Single-Binary Architecture |
+| :--- | :--- | :--- |
+| **Runtime Dependencies** | Python 3.11, PyTorch, Torchaudio, Transformers, PyO3, LibCUDA | **None** (Statically linked single binary) |
+| **Distribution Package Size** | Multi-GB folder or complex virtualenv bundle | **~1.6 MB** (`voicecli-linux-x86_64.tar.gz`) |
+| **Binary Executable Size** | Fragile wrapper DLLs + hundreds of shared `.so` files | **~3.9 MB single unified binary** |
+| **Cold-Start Time** | 10 – 20+ seconds (Python interpreter + PyTorch init) | **Sub-second startup** + direct model memory mapping |
+| **Hardware Acceleration** | Requires CUDA GPU or heavy PyTorch CPU backend | **Native CPU SIMD (AVX2, AVX-512, FMA) via GGML** |
+| **Audio Quality & Weights** | BF16 / FP16 PyTorch tensors | **Full-precision BF16 GGUF weights** (exact parity) |
+| **Audio Writing Pipeline** | `scipy.io.wavfile` / `soundfile` / `torchaudio` | **In-process native 24 kHz 16-bit PCM WAV writer** |
+| **Interactive Terminal UX** | Plain stdout logs or PyTorch debug dumps | **Braille spinner, animated progress bar & RTF speed stats** |
+| **Installation Friction** | Complex pip / conda / embed setup | **Extract `.tar.gz` and run** (zero configuration) |
 
 ---
 
 ## Architecture Overview
 
+`voicecli` combines high-level CLI ergonomics with low-level SIMD inference in a unified process space:
+
 ```
-                        +----------------------------+
-                        |       voicecli (Rust)      |
-                        |                            |
-                        |   - Parses CLI (clap)      |
-                        |   - JSON Schema Validation |
-                        |   - Performs Path Checks   |
-                        |   - Audio resample/silence |
-                        +--------------+-------------+
-                                       |
-                                       v (PyO3 GIL interface)
-                        +--------------+-------------+
-                        |      Embedded Python       |
-                        |   - model.py (In-Memory)   |
-                        |   - torch / torchaudio     |
-                        |   - transformers API       |
-                        +--------------+-------------+
++--------------------------------------------------------------------------+
+|                            voicecli Executable                           |
+|                                                                          |
+|  +--------------------------------------------------------------------+  |
+|  |                 Rust Frontend Layer (src/main.rs)                  |  |
+|  |   - CLI argument parsing via clap                                  |  |
+|  |   - Subcommands: `style` and `clone`                               |  |
+|  |   - Portable path resolution & environment configuration           |  |
+|  +-----------------------------------+--------------------------------+  |
+|                                      |                                   |
+|                                      v (Zero-Overhead Native C FFI)      |
+|  +-----------------------------------+--------------------------------+  |
+|  |                  Native C Engine Bridge (src/model.c)              |  |
+|  |   - Configuration parser (`settings.json` + ENV overrides)         |  |
+|  |   - Auto-setup: Resumable Hugging Face curl downloader             |  |
+|  |   - Interactive terminal UI: Braille spinner & dynamic progress bar|  |
+|  |   - Real-time factor (RTF) timing calculations                     |  |
+|  |   - In-process 16-bit 24kHz RIFF/WAVE file serializer              |  |
+|  +-----------------------------------+--------------------------------+  |
+|                                      |                                   |
+|                                      v (Direct C++ In-Process Call)      |
+|  +-----------------------------------+--------------------------------+  |
+|  |             qwen3-tts.cpp Inference Engine & GGML Core            |  |
+|  |   - 151,676-token BPE Text Tokenizer                               |  |
+|  |   - 12Hz Speech Tokenizer & Vocoder (Decoder)                      |  |
+|  |   - 1.7B / 0.6B Autoregressive Transformer with Code Prediction    |  |
+|  |   - Speaker Encoder & Reference Voice Tokenizer (ICL)              |  |
+|  |   - SIMD Vectorized Tensor Math (AVX2 / AVX512 / FMA / CPU Backend)|  |
+|  +--------------------------------------------------------------------+  |
++--------------------------------------------------------------------------+
                                        |
                                        v
-                        +--------------+-------------+
-                        |   Qwen3-TTS-12Hz-1.7B      |
-                        |   - VRAM / RAM Inference   |
-                        |   - Generates Speech       |
-                        +----------------------------+
+         +-----------------------------------------------------------+
+         |               Direct GGUF Weight Evaluation               |
+         |  - qwen-talker-1.7b-voicedesign-BF16.gguf (Voice Design)  |
+         |  - qwen-talker-1.7b-base-BF16.gguf        (Voice Clone)   |
+         |  - qwen-tokenizer-12hz-BF16.gguf          (12Hz Vocoder)  |
+         +-----------------------------------------------------------+
+                                       |
+                                       v
+                     +-----------------------------------+
+                     |  High-Fidelity 24 kHz WAV Output  |
+                     +-----------------------------------+
 ```
-
-1. **Rust Binary**: Handles CLI parsing via `clap`, parses and validates the input JSON configuration using `serde_json`, manages audio resampling for speed changes, appends pauses between segments, and writes the final audio using the `hound` crate.
-2. **Embedded Python (`model.py`)**: Runs inside the same process space using `PyO3`. It manages the lifecycle of the models, caches voice clone prompts (x-vectors) to minimize latency, runs the PyTorch model inference, and returns raw float samples to Rust.
-3. **Data Exchange**: Audio samples are returned from Python to Rust as lists of floats, avoiding external subprocesses or IPC overhead.
 
 ---
 
-## Detailed JSON Configuration Schema (`custom` command)
+## Key Features
 
-The `custom` command uses a unified JSON configuration interface. It accepts the path to a JSON file via `--input` (or `-i`) and saves the final concatenated WAV file to `--output` (or `-o`).
+- **Single Unified Binary**: The complete GGML tensor runtime and Qwen3-TTS C++ engine are statically compiled directly into `voicecli`. No secondary helper executables, no external runtimes, no DLL hell.
+- **Natural Language Voice Design (`style`)**: Control speaker identity, age, pitch, speaking pace, mood, and emotion using plain text descriptions (e.g. `"gender: Female. pitch: High. speed: Fast-paced. emotion: Cheerful."`).
+- **Zero-Shot Voice Cloning (`clone`)**: Clone any target speaker's voice from a short reference audio clip (3 to 15 seconds) without fine-tuning.
+- **Interactive Real-Time Progress Bar**:
+  - Live animated braille spinner (`⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏`).
+  - Smooth terminal progress bar with frame counters and estimated audio duration.
+  - Automatically detects whether standard error is a TTY (`isatty`), keeping CI/CD and piped logs clean while providing rich interactive output in terminals.
+- **Auto-Setup on First Run**: If model weights are not present locally, `voicecli` automatically fetches the official BF16 GGUF weights directly from Hugging Face with a resumable download progress bar.
+- **Zero Audio Processing Dependencies**: Implements a dedicated in-process 16-bit PCM 24 kHz WAV serializer, outputting broadcast-quality audio files directly.
+- **Flexible Configuration**: Fine-tune model selections and paths via `settings.json` or override them on the fly using environment variables.
 
-### Schema Definition
+---
+
+## Quick Start: Standalone Portable Bundle
+
+Pre-built standalone releases require no installation, no compilation, and no package managers.
+
+### 1. Extract the Archive
+```bash
+# Extract the portable bundle (approx. 1.6 MB)
+tar -xzf deploy/voicecli-linux-x86_64.tar.gz
+cd voicecli
+```
+
+The extracted directory contains only:
+```
+voicecli/
+├── voicecli        # Statically linked single executable (~3.9 MB)
+└── settings.json   # Configuration file
+```
+
+### 2. Run Voice Design (Style Synthesis)
+```bash
+./voicecli style \
+  --text "Hello! This speech is synthesized natively without Python or PyTorch." \
+  --prompt "gender: Female. pitch: Medium. speed: Normal." \
+  --output speech.wav
+```
+*(On your first execution, `voicecli` will automatically download the necessary GGUF model files into the local directory and then synthesize the audio).*
+
+### 3. Run Zero-Shot Voice Cloning
+```bash
+./voicecli clone \
+  --text "Now I am speaking with the acoustic characteristics of your reference audio." \
+  --audio-in path/to/reference.wav \
+  --output cloned_voice.wav
+```
+
+---
+
+## CLI Usage & Command Reference
+
+```
+Usage: voicecli <COMMAND>
+
+Commands:
+  style  Generate speech using Voice Design style descriptions
+  clone  Clone a voice from a short reference audio file
+  help   Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+---
+
+### 1. Voice Design / Acoustic Style (`voicecli style`)
+
+Generates speech from text guided by natural language prompts describing vocal characteristics, pitch, gender, pacing, or emotional coloring.
+
+```bash
+voicecli style [OPTIONS] --text <TEXT> --prompt <PROMPT>
+```
+
+#### Arguments & Flags
+
+| Flag | Short | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--text` | `-t` | *(Required)* | The textual content to convert into speech. |
+| `--prompt` | `-p` | *(Required)* | Acoustic style instructions (e.g. gender, pitch, speed, mood). |
+| `--output` | `-o` | `output.wav` | Path where the output 24 kHz `.wav` file will be saved. |
+
+#### Examples
+
+```bash
+# Cheerful female assistant
+./voicecli style \
+  -t "Good morning! You have three meetings scheduled for today." \
+  -p "gender: Female. pitch: High. speed: Normal. tone: Cheerful and professional." \
+  -o morning.wav
+
+# Deep, slow narration
+./voicecli style \
+  -t "The deep ocean remains one of the most enigmatic frontiers known to science." \
+  -p "gender: Male. pitch: Deep and resonant. speed: Slow. tone: Documentary narration." \
+  -o narration.wav
+```
+
+---
+
+### 2. Zero-Shot Voice Cloning (`voicecli clone`)
+
+Clones an individual speaker's voice using a short reference audio file. The reference sample should ideally be between 3 and 15 seconds long with clear speech and minimal background noise.
+
+```bash
+voicecli clone [OPTIONS] --text <TEXT> --audio-in <AUDIO_IN>
+```
+
+#### Arguments & Flags
+
+| Flag | Short | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `--text` | `-t` | *(Required)* | The textual content to synthesize in the cloned voice. |
+| `--audio-in` | `-a` | *(Required)* | Path to the reference `.wav` audio clip (3–15 seconds). |
+| `--output` | `-o` | `clone_output.wav` | Path where the cloned output `.wav` file will be saved. |
+
+#### Examples
+
+```bash
+# Clone a voice using reference sample
+./voicecli clone \
+  --text "This sentence is spoken entirely in the vocal timbre of the reference sample." \
+  --audio-in my_voice_sample.wav \
+  --output cloned_result.wav
+```
+
+---
+
+## Configuration & Settings
+
+`voicecli` uses a hierarchical configuration system. Values are resolved in the following priority order:
+1. **Environment Variables** (Highest precedence)
+2. **`settings.json`** (Located in the working directory or beside the executable)
+3. **Internal Built-in Defaults** (Lowest precedence)
+
+### Configuration File (`settings.json`)
+
 ```json
 {
-  "mode": "synthetic" | "clone",
-  "voice": {
-    "prompt": "string",     // Required for "synthetic" mode: voice style description
-    "audio": "string"       // Required for "clone" mode: path to reference audio file
-  },
-  "segments": [
-    {
-      "text": "string",          // Required: text to synthesize
-      "style": "string | null",  // Optional: style tags prepended to text (e.g. "whispered, tense")
-      "speed": "number | null",  // Optional: speed multiplier (0.5 = half speed, 2.0 = double)
-      "pause_after": "number"    // Optional: seconds of silence after this segment (defaults to 0.0)
-    }
-  ]
+  "model_name_style": "qwen-talker-1.7b-voicedesign-BF16.gguf",
+  "model_name_clone": "qwen-talker-1.7b-base-BF16.gguf",
+  "tokenizer_model": "qwen-tokenizer-12hz-BF16.gguf"
 }
 ```
 
-### Schema Rules & Validation
-- **`mode`**: Must be either `"synthetic"` or `"clone"`.
-- **`voice.prompt`**: Must be present and non-empty if `mode` is `"synthetic"`.
-- **`voice.audio`**: Must be present and point to an existing reference audio file if `mode` is `"clone"`.
-- **`segments`**: Must contain at least one segment.
-- **`speed`**: If specified, must be greater than `0.0`.
-- **`pause_after`**: If specified, must be non-negative.
+- **`model_name_style`**: The GGUF model file used for style-based synthesis (`voicecli style`).
+- **`model_name_clone`**: The GGUF model file used for zero-shot voice cloning (`voicecli clone`).
+- **`tokenizer_model`**: The 12Hz neural audio codec vocoder model.
 
----
+### Environment Variables
 
-## Usage
+You can override any setting without editing files by exporting environment variables:
 
-### 1. `custom` Subcommand (Unified JSON-driven interface)
-Runs the unified multi-segment speech generation.
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `VOICECLI_MODEL_DIR` | Custom directory path where `.gguf` model files are stored. | Searches `models/`, executable directory, or current folder |
+| `VOICECLI_MODEL_NAME_STYLE` | Filename of the style synthesis model to load. | `qwen-talker-1.7b-voicedesign-BF16.gguf` |
+| `VOICECLI_MODEL_NAME_CLONE` | Filename of the voice cloning model to load. | `qwen-talker-1.7b-base-BF16.gguf` |
+| `VOICECLI_TOKENIZER_MODEL` | Filename of the audio tokenizer / vocoder model. | `qwen-tokenizer-12hz-BF16.gguf` |
+| `VOICECLI_BASE_DIR` | Manually overrides the application base directory. | Directory containing the `voicecli` binary |
 
+#### Example: Using a Shared Central Model Directory
 ```bash
-# Basic usage
-voicecli custom --input examples/synthetic_config.json --output custom_output.wav
-
-# Short option usage
-voicecli custom -i examples/clone_config.json -o custom_cloned_output.wav
-```
-
-### 2. `style` Subcommand (Voice Design Wrapper)
-Generates speech using a natural language prompt. Behind the scenes, it builds a single-segment synthetic JSON config and executes the shared backend.
-
-```bash
-voicecli style --text "Welcome to the future of speech synthesis." --prompt "gender: Female. pitch: High. speed: Normal." --output style_out.wav
-```
-
-### 3. `clone` Subcommand (Voice Cloning Wrapper)
-Clones a target voice using a short reference audio file. Behaves as an alias that builds a single-segment cloning JSON config internally.
-
-```bash
-voicecli clone --text "Hello, I am speaking in your voice now." --audio-in reference.wav --output cloned_out.wav
+export VOICECLI_MODEL_DIR="/opt/models/qwen3-tts"
+./voicecli style -t "Using shared model cache." -p "clear voice" -o shared.wav
 ```
 
 ---
 
-## Portable Deployments & Cross-Compilation
+## Supported Models (GGUF BF16)
 
-To simplify deployment and keep the environment self-contained, `voicecli` can be packaged with portable Python runtimes (including CPU versions of `torch`, `torchaudio`, `soundfile`, and `qwen-tts`).
+`voicecli` operates with full bfloat16 (`BF16`) precision weights to preserve the original audio fidelity of the PyTorch reference models:
 
-### Packaging Linux & Windows Portables on Linux
-The repository contains a helper script `create_portable_packages.sh` that automates cross-compilation and packaging. It uses a temporary **Podman** container to cross-compile for Windows using `mingw-w64`.
+| Model Filename | Architecture | Role / Purpose | File Size |
+| :--- | :---: | :--- | :---: |
+| `qwen-tokenizer-12hz-BF16.gguf` | 12Hz Codec | Neural vocoder & reference audio encoder | ~358 MB |
+| `qwen-talker-1.7b-voicedesign-BF16.gguf` | 1.7B Transformer | Style-conditioned speech generation (`style`) | ~3.8 GB |
+| `qwen-talker-1.7b-base-BF16.gguf` | 1.7B Transformer | Zero-shot voice cloning (`clone`) | ~3.8 GB |
+| `qwen-talker-0.6b-base-BF16.gguf` | 0.6B Transformer | Ultra-fast cloning for low-memory environments | ~1.8 GB |
 
-To generate both packages, simply run:
+Weights are mirrored and maintained at [`Serveurperso/Qwen3-TTS-GGUF`](https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF) on Hugging Face.
+
+---
+
+## Building from Source
+
+If you want to build `voicecli` directly from source code:
+
+### Prerequisites
+
+Ensure the following native build tools are installed on your Linux system:
+
 ```bash
-./create_portable_packages.sh
+# Ubuntu / Debian
+sudo apt-get update
+sudo apt-get install -y build-essential cmake curl git
+
+# Install Rust toolchain (if not already installed)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source $HOME/.cargo/env
 ```
 
-This script performs the following tasks:
-1. **Linux Build**:
-   - Downloads a standalone Linux Python runtime (`cpython-3.11`).
-   - Uses `pip` to install local Python dependencies (`torch`, `torchaudio` from PyTorch CPU index, `qwen-tts`, `soundfile`).
-   - Compiles `voicecli` targeting `x86_64-unknown-linux-gnu`, setting the `rpath` so it links dynamically to the portable `python-embed/lib` folder.
-   - Compresses the build into `deploy/voicecli-linux-x86_64.tar.gz`.
-2. **Windows Build (Cross-Compiled)**:
-   - Spawns a temporary Podman container running the standard Rust image.
-   - Installs the MinGW cross-compiler and target `x86_64-pc-windows-gnu`.
-   - Cross-compiles `voicecli.exe` using `CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc`. Pyo3's `generate-import-lib` feature creates the required `.lib` files automatically without needing Windows development SDKs on host.
-   - Downloads the Windows Python 3.11 embeddable package and configures `python311._pth` import rules.
-   - Uses the host pip with cross-platform flags to download and unpack Windows CPU wheels for `torch`, `torchaudio`, `qwen-tts`, and `soundfile` directly into the staging folder.
-   - Compresses the build into `deploy/voicecli-windows.zip`.
+### Compiling the Unified Binary
+
+1. Clone the repository recursively to fetch all submodules and engine sources:
+   ```bash
+   git clone https://github.com/ultrapg/voicecli.git
+   cd voicecli
+   ```
+
+2. Compile in release mode with Cargo:
+   ```bash
+   cargo build --release
+   ```
+
+The custom `build.rs` script will automatically compile `src/model.c`, link against the static GGML engine libraries, and produce the single unified executable at `target/release/voicecli`.
+
+### Generating the Portable `.tar.gz` Package
+
+Run the bundle creation script:
+```bash
+./create_portable.sh
+```
+
+This script will:
+1. Compile the release binary (`cargo build --release`).
+2. Stage the `voicecli` binary alongside `settings.json`.
+3. Package everything into a clean archive at `deploy/voicecli-linux-x86_64.tar.gz`.
 
 ---
 
-## Example Configurations
+## Technical Specifications & Audio Pipeline
 
-You can find reference configurations in the repository under:
-- **Synthetic (Voice Design)**: [examples/synthetic_config.json](examples/synthetic_config.json)
-- **Voice Cloning**: [examples/clone_config.json](examples/clone_config.json)
-
----
-
-## Performance & Dtype Optimizations
-- **bfloat16 CPU fallback**: When no NVIDIA GPU/CUDA is detected, `voicecli` uses `torch.bfloat16` for CPU inference. This reduces memory footprint by 50% and improves inference speed significantly on CPU architectures.
-
-## Troubleshooting
-
-### Linux: Shared Library Missing (`libpython3.11.so.1.0`)
-If you run the binary outside the portable folder and receive dynamic link errors:
-- Ensure `LD_LIBRARY_PATH` includes the `python-embed/lib` folder.
-- When executing the binary, it checks `python-embed` next to the executable or in the current working directory, falling back to the system environment if needed.
-
-### Windows: `STATUS_DLL_NOT_FOUND (0xc0000135)`
-- Ensure the portable `python311.dll` and other runtime dependencies are kept in the same directory as the `voicecli.exe` binary.
+- **Audio Sampling Rate**: 24,000 Hz (24 kHz)
+- **Audio Encoding**: 16-bit Linear PCM (Single Channel / Mono)
+- **Audio Format**: RIFF / WAVE (.wav)
+- **Speech Tokenizer Frequency**: 12 Hz (12 frames of discrete acoustic codes per second of generated audio)
+- **Codebooks**: 16 codebooks per frame
+- **Text Tokenizer**: 151,676-token BPE tokenizer
+- **Inference Precision**: Full BF16 / FP16 SIMD execution
+- **Thread Scheduling**: Automatic multi-core thread scaling matching host CPU topology
 
 ---
 
-## License
+## Troubleshooting & FAQ
 
-GNU General Public License v3.0
+### Q: Does `voicecli` require a GPU or NVIDIA drivers?
+**No.** `voicecli` runs natively on CPU using optimized SIMD instructions (AVX2 / AVX512 / FMA). You do not need CUDA, ROCm, or dedicated GPU hardware to generate speech.
+
+### Q: Where are downloaded models stored?
+By default, `voicecli` places downloaded models in the `models/` directory or directly alongside the executable. You can store models in any central location by setting `export VOICECLI_MODEL_DIR=/path/to/my/models`.
+
+### Q: Why is my terminal progress bar showing multiple lines in CI/CD?
+In non-interactive environments where `stderr` is not an interactive terminal (e.g. piped to `grep` or running in a CI runner), `voicecli` detects that `isatty(fileno(stderr))` is false and automatically switches from ANSI line-clearing updates to periodic milestone logging every 20 frames.
+
+### Q: Can I interrupt generation safely?
+Yes. Sending `Ctrl+C` cleanly terminates the process immediately without leaving dangling background threads or child processes.
+
+---
+
+## License & Acknowledgments
+
+- **License**: Licensed under the [GNU General Public License v3.0](LICENSE).
+- **Qwen3-TTS**: Developed and trained by Alibaba Cloud / Qwen Team.
+- **GGML**: Tensor library developed by Georgi Gerganov and the GGML community.
+- **Qwen3-TTS C++ Core**: Native C++ port based on `qwen3-tts.cpp`.
