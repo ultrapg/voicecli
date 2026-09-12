@@ -3,19 +3,21 @@ use std::ffi::CString;
 use std::path::Path;
 
 extern "C" {
-    fn c_generate_style(text: *const i8, prompt: *const i8, output_path: *const i8);
-    fn c_generate_clone(text: *const i8, audio_path: *const i8, output_path: *const i8);
+    fn c_generate_style(text: *const i8, prompt: *const i8, output_path: *const i8, speed: f32);
+    fn c_generate_clone(text: *const i8, audio_path: *const i8, output_path: *const i8, speed: f32);
     fn c_generate_style_chunked(
         chunks: *const *const i8,
         num_chunks: i32,
         prompt: *const i8,
         output_path: *const i8,
+        speed: f32,
     );
     fn c_generate_clone_chunked(
         chunks: *const *const i8,
         num_chunks: i32,
         audio_path: *const i8,
         output_path: *const i8,
+        speed: f32,
     );
 }
 
@@ -49,6 +51,10 @@ enum Commands {
         #[arg(long, short, default_value = "output.wav")]
         output: String,
 
+        /// Speech speed multiplier (e.g. 0.8 for slower, 1.25 for faster, default: 1.0)
+        #[arg(long, short = 's', default_value_t = 1.0)]
+        speed: f32,
+
         /// Automatically split long text into natural chunks and stitch audio together
         #[arg(long)]
         chunk: bool,
@@ -70,6 +76,10 @@ enum Commands {
         /// Path to save the generated .wav file
         #[arg(long, short, default_value = "clone_output.wav")]
         output: String,
+
+        /// Speech speed multiplier (e.g. 0.8 for slower, 1.25 for faster, default: 1.0)
+        #[arg(long, short = 's', default_value_t = 1.0)]
+        speed: f32,
 
         /// Automatically split long text into natural chunks and stitch audio together
         #[arg(long)]
@@ -110,6 +120,187 @@ fn resolve_input_text(text: Option<String>, file: Option<String>) -> Result<Stri
     }
 }
 
+fn validate_speed(speed: f32) -> Result<(), String> {
+    if speed < 0.25 || speed > 3.0 || speed.is_nan() {
+        Err(format!(
+            "Speech speed must be between 0.25 and 3.0 (got {}).",
+            speed
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn is_abbreviation(word: &str) -> bool {
+    let clean = word.trim_matches(|c: char| {
+        c == '"'
+            || c == '\''
+            || c == '('
+            || c == ')'
+            || c == '['
+            || c == ']'
+            || c == '{'
+            || c == '}'
+            || c == '“'
+            || c == '”'
+            || c == '‘'
+            || c == '’'
+    });
+    let lower = clean.to_lowercase();
+
+    const KNOWN_ABBREVS: &[&str] = &[
+        "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "rev.", "gen.", "gov.",
+        "sgt.", "capt.", "lt.", "col.", "vs.", "e.g.", "i.e.", "etc.", "al.",
+        "approx.", "appx.", "dept.", "fig.", "no.", "vol.", "est.", "inc.",
+        "corp.", "co.", "ltd.", "st.", "ave.", "rd.", "blvd.", "u.s.", "u.k.",
+        "e.u.", "a.m.", "p.m.", "am.", "pm.", "a.d.", "b.c.",
+    ];
+
+    if KNOWN_ABBREVS.contains(&lower.as_str()) {
+        return true;
+    }
+
+    // Single-letter initials like "J." or "W."
+    let chars: Vec<char> = clean.chars().collect();
+    if chars.len() == 2 && chars[0].is_alphabetic() && chars[1] == '.' {
+        return true;
+    }
+
+    false
+}
+
+fn extract_sentences(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut last = 0;
+    let mut i = 0;
+
+    while i < len {
+        let c = chars[i];
+        if c == '.' || c == '!' || c == '?' || c == '。' || c == '！' || c == '？' {
+            // Ignore ellipsis (e.g. '..')
+            if i + 1 < len && chars[i + 1] == '.' {
+                i += 1;
+                continue;
+            }
+
+            // Consume any trailing closing quotes or brackets
+            let mut end_punct = i;
+            while end_punct + 1 < len {
+                let next_c = chars[end_punct + 1];
+                if next_c == '"'
+                    || next_c == '\''
+                    || next_c == '”'
+                    || next_c == '’'
+                    || next_c == '»'
+                    || next_c == ')'
+                    || next_c == ']'
+                    || next_c == '}'
+                {
+                    end_punct += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Check if boundary is followed by whitespace or end of string
+            if end_punct + 1 == len || chars[end_punct + 1].is_whitespace() {
+                // If followed by lowercase letters (e.g. dialogue tag: `"Hello!" she said.`), do not split
+                let mut is_dialogue_continuation = false;
+                let mut next_idx = end_punct + 1;
+                while next_idx < len && chars[next_idx].is_whitespace() {
+                    next_idx += 1;
+                }
+                if next_idx < len && chars[next_idx].is_lowercase() {
+                    is_dialogue_continuation = true;
+                }
+
+                let preceding: String = chars[last..=i].iter().collect();
+                let last_word = preceding.split_whitespace().last().unwrap_or("");
+                if !is_dialogue_continuation && !is_abbreviation(last_word) {
+                    let sentence_str: String = chars[last..=end_punct].iter().collect();
+                    let trimmed = sentence_str.trim().to_string();
+                    if !trimmed.is_empty() {
+                        sentences.push(trimmed);
+                    }
+                    last = end_punct + 1;
+                    i = end_punct;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    if last < len {
+        let remaining: String = chars[last..].iter().collect();
+        let trimmed = remaining.trim().to_string();
+        if !trimmed.is_empty() {
+            sentences.push(trimmed);
+        }
+    }
+
+    sentences
+}
+
+fn split_long_sentence(sentence: &str, target_chars: usize) -> Vec<String> {
+    if sentence.chars().count() <= target_chars {
+        return vec![sentence.to_string()];
+    }
+
+    let mut parts = Vec::new();
+    let mut remaining = sentence.trim().to_string();
+
+    const CLAUSE_DELIMS: &[&str] = &[
+        "; ", ": ", " — ", " – ", " -- ",
+        ", and ", ", but ", ", however, ", ", although ",
+        ", because ", ", while ", ", which ", ", whereas ",
+        ", so ", ", or ", ", yet ", ", "
+    ];
+
+    while remaining.chars().count() > target_chars {
+        let count = remaining.chars().count();
+        let search_limit = std::cmp::min(count, target_chars + 50);
+        let window: String = remaining.chars().take(search_limit).collect();
+
+        let mut best_break = None;
+
+        for &delim in CLAUSE_DELIMS {
+            if let Some(pos) = window.rfind(delim) {
+                let char_pos = window[..pos].chars().count();
+                if char_pos >= target_chars / 3 {
+                    let delim_char_len = delim.trim_end().chars().count();
+                    best_break = Some(char_pos + delim_char_len);
+                    break;
+                }
+            }
+        }
+
+        if best_break.is_none() {
+            if let Some(pos) = window.rfind(' ') {
+                let char_pos = window[..pos].chars().count();
+                if char_pos >= target_chars / 3 {
+                    best_break = Some(char_pos);
+                }
+            }
+        }
+
+        let break_point = best_break.unwrap_or(target_chars);
+        let chunk: String = remaining.chars().take(break_point).collect();
+        let chunk_trimmed = chunk.trim().to_string();
+        if !chunk_trimmed.is_empty() {
+            parts.push(chunk_trimmed);
+        }
+        remaining = remaining.chars().skip(break_point).collect::<String>().trim().to_string();
+    }
+
+    if !remaining.is_empty() {
+        parts.push(remaining);
+    }
+
+    parts
+}
+
 fn split_into_chunks(text: &str, target_chars: usize) -> Vec<String> {
     let mut chunks = Vec::new();
     let text = text.trim();
@@ -126,86 +317,35 @@ fn split_into_chunks(text: &str, target_chars: usize) -> Vec<String> {
     let mut current_chunk = String::new();
 
     for para in paragraphs {
-        let mut sentences = Vec::new();
-        let mut last = 0;
-        let chars: Vec<char> = para.chars().collect();
-        let mut i = 0;
-        while i < chars.len() {
-            let c = chars[i];
-            if c == '.' || c == '!' || c == '?' || c == '。' || c == '！' || c == '？' {
-                if i + 1 == chars.len()
-                    || chars[i + 1].is_whitespace()
-                    || chars[i + 1] == '"'
-                    || chars[i + 1] == '\''
-                {
-                    let sentence_str: String = chars[last..=i].iter().collect();
-                    let trimmed = sentence_str.trim();
-                    let is_abbrev = trimmed.ends_with("Mr.")
-                        || trimmed.ends_with("Mrs.")
-                        || trimmed.ends_with("Dr.")
-                        || trimmed.ends_with("Prof.")
-                        || trimmed.ends_with("vs.")
-                        || trimmed.ends_with("e.g.")
-                        || trimmed.ends_with("i.e.")
-                        || trimmed.ends_with("etc.");
-                    if !is_abbrev {
-                        sentences.push(sentence_str);
-                        last = i + 1;
-                    }
-                }
-            }
-            i += 1;
-        }
-        if last < chars.len() {
-            let remaining: String = chars[last..].iter().collect();
-            if !remaining.trim().is_empty() {
-                sentences.push(remaining);
-            }
-        }
+        let sentences = extract_sentences(para);
 
-        for sentence in sentences {
-            let s = sentence.trim();
-            if s.is_empty() {
-                continue;
-            }
+        for s in sentences {
+            let sub_sentences = split_long_sentence(&s, target_chars);
 
-            if s.chars().count() > target_chars + (target_chars / 2) {
-                if !current_chunk.is_empty() {
-                    chunks.push(current_chunk.clone());
-                    current_chunk.clear();
+            for sub in sub_sentences {
+                let sub = sub.trim();
+                if sub.is_empty() {
+                    continue;
                 }
 
-                let mut clause_acc = String::new();
-                for word in s.split_whitespace() {
-                    if clause_acc.chars().count() + word.chars().count() + 1 > target_chars
-                        && !clause_acc.is_empty()
-                    {
-                        chunks.push(clause_acc.clone());
-                        clause_acc.clear();
-                    }
-                    if !clause_acc.is_empty() {
-                        clause_acc.push(' ');
-                    }
-                    clause_acc.push_str(word);
-                }
-                if !clause_acc.is_empty() {
-                    chunks.push(clause_acc);
-                }
-            } else {
-                if current_chunk.chars().count() + s.chars().count() + 1 > target_chars
-                    && !current_chunk.is_empty()
-                {
-                    chunks.push(current_chunk.clone());
-                    current_chunk.clear();
-                }
-                if !current_chunk.is_empty() {
+                let current_len = current_chunk.chars().count();
+                let sub_len = sub.chars().count();
+
+                if current_len == 0 {
+                    current_chunk.push_str(sub);
+                } else if current_len + sub_len + 1 <= target_chars {
                     current_chunk.push(' ');
+                    current_chunk.push_str(sub);
+                } else {
+                    chunks.push(current_chunk.clone());
+                    current_chunk.clear();
+                    current_chunk.push_str(sub);
                 }
-                current_chunk.push_str(s);
             }
         }
 
-        if current_chunk.chars().count() >= target_chars / 2 {
+        // At natural paragraph boundaries, flush chunk if substantial to respect paragraph rhythm
+        if current_chunk.chars().count() >= (target_chars * 2) / 3 {
             chunks.push(current_chunk.clone());
             current_chunk.clear();
         }
@@ -237,8 +377,14 @@ fn main() {
             file,
             prompt,
             output,
+            speed,
             chunk,
         } => {
+            if let Err(err) = validate_speed(speed) {
+                eprintln!("[-] Error: {}", err);
+                std::process::exit(1);
+            }
+
             let input_text = match resolve_input_text(text, file) {
                 Ok(t) => t,
                 Err(err) => {
@@ -248,7 +394,7 @@ fn main() {
             };
 
             if chunk {
-                let chunks = split_into_chunks(&input_text, 280);
+                let chunks = split_into_chunks(&input_text, 600);
                 if chunks.is_empty() {
                     eprintln!("[-] Error: No valid text to synthesize.");
                     std::process::exit(1);
@@ -259,7 +405,7 @@ fn main() {
                     let c_prompt = CString::new(prompt).unwrap();
                     let c_output = CString::new(output).unwrap();
                     unsafe {
-                        c_generate_style(c_text.as_ptr(), c_prompt.as_ptr(), c_output.as_ptr());
+                        c_generate_style(c_text.as_ptr(), c_prompt.as_ptr(), c_output.as_ptr(), speed);
                     }
                 } else {
                     println!(
@@ -279,6 +425,7 @@ fn main() {
                             c_ptrs.len() as i32,
                             c_prompt.as_ptr(),
                             c_output.as_ptr(),
+                            speed,
                         );
                     }
                 }
@@ -287,7 +434,7 @@ fn main() {
                 let c_prompt = CString::new(prompt).unwrap();
                 let c_output = CString::new(output).unwrap();
                 unsafe {
-                    c_generate_style(c_text.as_ptr(), c_prompt.as_ptr(), c_output.as_ptr());
+                    c_generate_style(c_text.as_ptr(), c_prompt.as_ptr(), c_output.as_ptr(), speed);
                 }
             }
         }
@@ -296,8 +443,14 @@ fn main() {
             file,
             audio_in,
             output,
+            speed,
             chunk,
         } => {
+            if let Err(err) = validate_speed(speed) {
+                eprintln!("[-] Error: {}", err);
+                std::process::exit(1);
+            }
+
             let path = Path::new(&audio_in);
             if !path.exists() {
                 eprintln!("[-] Error: Reference audio file '{}' does not exist.", audio_in);
@@ -313,7 +466,7 @@ fn main() {
             };
 
             if chunk {
-                let chunks = split_into_chunks(&input_text, 280);
+                let chunks = split_into_chunks(&input_text, 600);
                 if chunks.is_empty() {
                     eprintln!("[-] Error: No valid text to synthesize.");
                     std::process::exit(1);
@@ -324,7 +477,7 @@ fn main() {
                     let c_audio = CString::new(audio_in).unwrap();
                     let c_output = CString::new(output).unwrap();
                     unsafe {
-                        c_generate_clone(c_text.as_ptr(), c_audio.as_ptr(), c_output.as_ptr());
+                        c_generate_clone(c_text.as_ptr(), c_audio.as_ptr(), c_output.as_ptr(), speed);
                     }
                 } else {
                     println!(
@@ -344,6 +497,7 @@ fn main() {
                             c_ptrs.len() as i32,
                             c_audio.as_ptr(),
                             c_output.as_ptr(),
+                            speed,
                         );
                     }
                 }
@@ -352,7 +506,7 @@ fn main() {
                 let c_audio = CString::new(audio_in).unwrap();
                 let c_output = CString::new(output).unwrap();
                 unsafe {
-                    c_generate_clone(c_text.as_ptr(), c_audio.as_ptr(), c_output.as_ptr());
+                    c_generate_clone(c_text.as_ptr(), c_audio.as_ptr(), c_output.as_ptr(), speed);
                 }
             }
         }
@@ -411,5 +565,51 @@ mod tests {
     fn test_resolve_input_text_none() {
         let res = resolve_input_text(None, None);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_validate_speed_valid() {
+        assert!(validate_speed(1.0).is_ok());
+        assert!(validate_speed(0.25).is_ok());
+        assert!(validate_speed(3.0).is_ok());
+        assert!(validate_speed(1.5).is_ok());
+        assert!(validate_speed(0.8).is_ok());
+    }
+
+    #[test]
+    fn test_validate_speed_invalid() {
+        assert!(validate_speed(0.2).is_err());
+        assert!(validate_speed(3.1).is_err());
+        assert!(validate_speed(-1.0).is_err());
+        assert!(validate_speed(f32::NAN).is_err());
+    }
+
+    #[test]
+    fn test_extract_sentences_quotes() {
+        let text = "He said, \"The results are in!\" Then he smiled. \"Are you sure?\" she asked.";
+        let sents = extract_sentences(text);
+        assert_eq!(sents.len(), 3);
+        assert_eq!(sents[0], "He said, \"The results are in!\"");
+        assert_eq!(sents[1], "Then he smiled.");
+        assert_eq!(sents[2], "\"Are you sure?\" she asked.");
+    }
+
+    #[test]
+    fn test_extract_sentences_abbreviations_and_initials() {
+        let text = "Dr. Smith met with Mr. Brown at 5 p.m. to discuss J. K. Rowling books. The U.S. team agreed.";
+        let sents = extract_sentences(text);
+        assert_eq!(sents.len(), 2);
+        assert_eq!(sents[0], "Dr. Smith met with Mr. Brown at 5 p.m. to discuss J. K. Rowling books.");
+        assert_eq!(sents[1], "The U.S. team agreed.");
+    }
+
+    #[test]
+    fn test_split_long_sentence_clauses() {
+        let text = "Artificial intelligence has undergone remarkable transformations over the past decade, and researchers from across the globe have contributed to breakthrough architectures, while industry leaders invested billions of dollars to build distributed computing clusters.";
+        let parts = split_long_sentence(text, 120);
+        assert!(parts.len() >= 2);
+        for part in &parts {
+            assert!(!part.trim().is_empty());
+        }
     }
 }

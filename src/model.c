@@ -3,6 +3,10 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <stdint.h>
+#include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #include "qwen3_tts_c.h"
 
 #ifdef _WIN32
@@ -225,7 +229,96 @@ static int save_wav_file(const char *filename, const float *samples, int num_sam
     return 0;
 }
 
-void c_generate_style(const char* text, const char* prompt, const char* output_path) {
+static float* apply_sola_timestretch(const float* in_samples, int in_len, int sample_rate, float speed, int* out_len) {
+    if (!in_samples || in_len <= 0) {
+        *out_len = 0;
+        return NULL;
+    }
+    if (fabsf(speed - 1.0f) < 0.01f) {
+        float* copy = (float*)malloc(in_len * sizeof(float));
+        if (!copy) {
+            *out_len = 0;
+            return NULL;
+        }
+        memcpy(copy, in_samples, in_len * sizeof(float));
+        *out_len = in_len;
+        return copy;
+    }
+
+    int W = (int)(0.025f * sample_rate); // 25ms = 600 samples at 24kHz
+    if (W < 64) W = 64;
+    int L = W / 2;                        // 50% overlap = 300 samples
+    int S_s = W - L;                      // synthesis step = 300 samples
+    int S_a = (int)roundf(S_s * speed);   // analysis step
+    if (S_a < 1) S_a = 1;
+    int delta = (int)(0.005f * sample_rate); // 5ms search window = 120 samples
+    if (delta < 8) delta = 8;
+
+    if (in_len <= W + delta) {
+        float* copy = (float*)malloc(in_len * sizeof(float));
+        if (!copy) { *out_len = 0; return NULL; }
+        memcpy(copy, in_samples, in_len * sizeof(float));
+        *out_len = in_len;
+        return copy;
+    }
+
+    size_t est_out = (size_t)((float)in_len / speed) + W * 4;
+    float* y = (float*)calloc(est_out, sizeof(float));
+    if (!y) {
+        *out_len = 0;
+        return NULL;
+    }
+
+    memcpy(y, in_samples, W * sizeof(float));
+    int out_pos = S_s;
+    int in_pos = S_a;
+
+    while (in_pos + W + delta < in_len && (size_t)(out_pos + W) < est_out) {
+        int best_k = 0;
+        float best_corr = -1e30f;
+
+        for (int k = -delta; k <= delta; k++) {
+            int actual_idx = in_pos + k;
+            if (actual_idx < 0 || actual_idx + L > in_len) continue;
+
+            float dot = 0.0f;
+            float norm_cand = 0.0f;
+            for (int j = 0; j < L; j++) {
+                float y_val = y[out_pos + j];
+                float x_val = in_samples[actual_idx + j];
+                dot += y_val * x_val;
+                norm_cand += x_val * x_val;
+            }
+            float score = dot / (sqrtf(norm_cand) + 1e-6f);
+            if (score > best_corr) {
+                best_corr = score;
+                best_k = k;
+            }
+        }
+
+        int actual_in = in_pos + best_k;
+        if (actual_in < 0) actual_in = 0;
+        if (actual_in + W > in_len) actual_in = in_len - W;
+
+        for (int j = 0; j < L; j++) {
+            float fade = (float)j / (float)L;
+            y[out_pos + j] = (1.0f - fade) * y[out_pos + j] + fade * in_samples[actual_in + j];
+        }
+        for (int j = L; j < W; j++) {
+            y[out_pos + j] = in_samples[actual_in + j];
+        }
+
+        out_pos += S_s;
+        in_pos += S_a;
+    }
+
+    int final_len = out_pos + L;
+    if (final_len > (int)est_out) final_len = (int)est_out;
+    *out_len = final_len;
+    return y;
+}
+
+void c_generate_style(const char* text, const char* prompt, const char* output_path, float speed) {
     char model_name[256];
     get_setting_string("model_name_style", model_name, sizeof(model_name), "qwen-talker-1.7b-voicedesign-BF16.gguf");
 
@@ -255,9 +348,30 @@ void c_generate_style(const char* text, const char* prompt, const char* output_p
     }
     printf("[+] Model loaded successfully.\n");
 
-    printf("[*] Generating speech for text: \"%s\"\n", text);
+    char final_prompt[1024];
     if (prompt && strlen(prompt) > 0) {
-        printf("[*] Acoustic style description: \"%s\"\n", prompt);
+        strncpy(final_prompt, prompt, sizeof(final_prompt) - 1);
+        final_prompt[sizeof(final_prompt) - 1] = '\0';
+    } else {
+        final_prompt[0] = '\0';
+    }
+
+    if (strstr(final_prompt, "speed") == NULL && strstr(final_prompt, "Speed") == NULL) {
+        if (speed >= 1.25f && strlen(final_prompt) + 20 < sizeof(final_prompt)) {
+            if (strlen(final_prompt) > 0) strcat(final_prompt, ". ");
+            strcat(final_prompt, "speed: Fast-paced.");
+        } else if (speed <= 0.85f && strlen(final_prompt) + 20 < sizeof(final_prompt)) {
+            if (strlen(final_prompt) > 0) strcat(final_prompt, ". ");
+            strcat(final_prompt, "speed: Slow-paced.");
+        }
+    }
+
+    printf("[*] Generating speech for text: \"%s\"\n", text);
+    if (strlen(final_prompt) > 0) {
+        printf("[*] Acoustic style description: \"%s\"\n", final_prompt);
+    }
+    if (fabsf(speed - 1.0f) >= 0.01f) {
+        printf("[*] Speech speed multiplier: %.2fx\n", speed);
     }
 
     tts_progress_t prog;
@@ -279,14 +393,27 @@ void c_generate_style(const char* text, const char* prompt, const char* output_p
     params.print_progress = 0;
     params.print_timing = 0;
     params.repetition_penalty = 1.05f;
-    params.instruction = (prompt && strlen(prompt) > 0) ? prompt : NULL;
+    params.instruction = (strlen(final_prompt) > 0) ? final_prompt : NULL;
 
     qwen3_tts_result_t result = qwen3_tts_synthesize(ctx, text, params);
     if (!result.success || result.audio_len <= 0) {
         if (prog.is_tty) fprintf(stderr, "\r\033[K");
         fprintf(stderr, "[-] Native synthesis failed: %s\n", result.error_msg ? result.error_msg : "unknown error");
     } else {
-        double audio_sec = result.sample_rate > 0 ? (double)result.audio_len / (double)result.sample_rate : 0.0;
+        const float* final_audio = result.audio;
+        int final_samples = result.audio_len;
+        float* stretched = NULL;
+
+        if (fabsf(speed - 1.0f) >= 0.01f) {
+            int stretched_len = 0;
+            stretched = apply_sola_timestretch(result.audio, result.audio_len, result.sample_rate, speed, &stretched_len);
+            if (stretched && stretched_len > 0) {
+                final_audio = stretched;
+                final_samples = stretched_len;
+            }
+        }
+
+        double audio_sec = result.sample_rate > 0 ? (double)final_samples / (double)result.sample_rate : 0.0;
         double wall_sec = (double)result.t_total_ms / 1000.0;
         double rtf = wall_sec > 0.0 ? audio_sec / wall_sec : 0.0;
         if (prog.is_tty) {
@@ -297,18 +424,20 @@ void c_generate_style(const char* text, const char* prompt, const char* output_p
                     audio_sec, wall_sec, rtf);
         }
         printf("[*] Saving audio to %s (Sample Rate: %d Hz)...\n", output_path, result.sample_rate);
-        if (save_wav_file(output_path, result.audio, result.audio_len, result.sample_rate) == 0) {
+        if (save_wav_file(output_path, final_audio, final_samples, result.sample_rate) == 0) {
             printf("[+] Audio generation complete!\n");
         } else {
             fprintf(stderr, "[-] Error: Failed to write audio file %s\n", output_path);
         }
+
+        if (stretched) free(stretched);
     }
 
     qwen3_tts_free_result(result);
     qwen3_tts_free(ctx);
 }
 
-void c_generate_clone(const char* text, const char* audio_path, const char* output_path) {
+void c_generate_clone(const char* text, const char* audio_path, const char* output_path, float speed) {
     char model_name[256];
     get_setting_string("model_name_clone", model_name, sizeof(model_name), "qwen-talker-1.7b-base-BF16.gguf");
 
@@ -340,6 +469,9 @@ void c_generate_clone(const char* text, const char* audio_path, const char* outp
 
     printf("[*] Cloning voice from reference audio: %s\n", audio_path);
     printf("[*] Generating speech for text: \"%s\"\n", text);
+    if (fabsf(speed - 1.0f) >= 0.01f) {
+        printf("[*] Speech speed multiplier: %.2fx\n", speed);
+    }
     printf("[*] Extracting speaker embedding and reference audio codes...\n");
     fflush(stdout);
 
@@ -368,7 +500,20 @@ void c_generate_clone(const char* text, const char* audio_path, const char* outp
         if (prog.is_tty) fprintf(stderr, "\r\033[K");
         fprintf(stderr, "[-] Native voice cloning failed: %s\n", result.error_msg ? result.error_msg : "unknown error");
     } else {
-        double audio_sec = result.sample_rate > 0 ? (double)result.audio_len / (double)result.sample_rate : 0.0;
+        const float* final_audio = result.audio;
+        int final_samples = result.audio_len;
+        float* stretched = NULL;
+
+        if (fabsf(speed - 1.0f) >= 0.01f) {
+            int stretched_len = 0;
+            stretched = apply_sola_timestretch(result.audio, result.audio_len, result.sample_rate, speed, &stretched_len);
+            if (stretched && stretched_len > 0) {
+                final_audio = stretched;
+                final_samples = stretched_len;
+            }
+        }
+
+        double audio_sec = result.sample_rate > 0 ? (double)final_samples / (double)result.sample_rate : 0.0;
         double wall_sec = (double)result.t_total_ms / 1000.0;
         double rtf = wall_sec > 0.0 ? audio_sec / wall_sec : 0.0;
         if (prog.is_tty) {
@@ -379,18 +524,102 @@ void c_generate_clone(const char* text, const char* audio_path, const char* outp
                     audio_sec, wall_sec, rtf);
         }
         printf("[*] Saving audio to %s (Sample Rate: %d Hz)...\n", output_path, result.sample_rate);
-        if (save_wav_file(output_path, result.audio, result.audio_len, result.sample_rate) == 0) {
+        if (save_wav_file(output_path, final_audio, final_samples, result.sample_rate) == 0) {
             printf("[+] Audio generation complete!\n");
         } else {
             fprintf(stderr, "[-] Error: Failed to write audio file %s\n", output_path);
         }
+
+        if (stretched) free(stretched);
     }
 
     qwen3_tts_free_result(result);
     qwen3_tts_free(ctx);
 }
 
-void c_generate_style_chunked(const char** chunks, int num_chunks, const char* prompt, const char* output_path) {
+static void append_chunk_audio(
+    float** full_audio,
+    size_t* total_samples,
+    size_t* audio_capacity,
+    const float* chunk_audio,
+    int chunk_len,
+    int sample_rate,
+    int is_last_chunk
+) {
+    if (!chunk_audio || chunk_len <= 0) return;
+
+    // 1. Trim leading and trailing vocoder silence / low-level room noise
+    float threshold = 0.003f;
+    int margin_start = (int)(sample_rate * 0.015f); // 15ms onset margin
+    int margin_end   = (int)(sample_rate * 0.025f); // 25ms decay margin
+
+    int start = 0;
+    while (start < chunk_len && fabsf(chunk_audio[start]) < threshold) {
+        start++;
+    }
+    start = (start > margin_start) ? start - margin_start : 0;
+
+    int end = chunk_len - 1;
+    while (end > start && fabsf(chunk_audio[end]) < threshold) {
+        end--;
+    }
+    end = (end + margin_end < chunk_len) ? end + margin_end : chunk_len - 1;
+
+    int clean_len = end - start + 1;
+    if (clean_len <= 0) {
+        clean_len = chunk_len;
+        start = 0;
+    }
+
+    // Allocate temporary buffer for smooth Hann window fade-in/fade-out
+    float* temp = (float*)malloc(clean_len * sizeof(float));
+    if (!temp) return;
+    memcpy(temp, chunk_audio + start, clean_len * sizeof(float));
+
+    // Smooth Hann fade-in (15ms)
+    int fade_in = (int)(sample_rate * 0.015f);
+    if (fade_in > clean_len / 2) fade_in = clean_len / 2;
+    for (int j = 0; j < fade_in; j++) {
+        float factor = 0.5f * (1.0f - cosf((float)M_PI * (float)j / (float)fade_in));
+        temp[j] *= factor;
+    }
+
+    // Smooth Hann fade-out (20ms)
+    int fade_out = (int)(sample_rate * 0.020f);
+    if (fade_out > clean_len / 2) fade_out = clean_len / 2;
+    for (int j = 0; j < fade_out; j++) {
+        float factor = 0.5f * (1.0f + cosf((float)M_PI * (float)j / (float)fade_out));
+        temp[clean_len - fade_out + j] *= factor;
+    }
+
+    // Natural 150ms breathing pause between chunks
+    int silence_samples = is_last_chunk ? 0 : (int)(sample_rate * 0.15f);
+
+    size_t needed = *total_samples + clean_len + silence_samples;
+    if (needed > *audio_capacity) {
+        size_t new_cap = needed * 2;
+        float* new_buf = (float*)realloc(*full_audio, new_cap * sizeof(float));
+        if (!new_buf) {
+            fprintf(stderr, "[-] Error: Failed to reallocate audio buffer\n");
+            free(temp);
+            return;
+        }
+        *full_audio = new_buf;
+        *audio_capacity = new_cap;
+    }
+
+    memcpy(*full_audio + *total_samples, temp, clean_len * sizeof(float));
+    *total_samples += clean_len;
+
+    if (silence_samples > 0) {
+        memset(*full_audio + *total_samples, 0, silence_samples * sizeof(float));
+        *total_samples += silence_samples;
+    }
+
+    free(temp);
+}
+
+void c_generate_style_chunked(const char** chunks, int num_chunks, const char* prompt, const char* output_path, float speed) {
     if (!chunks || num_chunks <= 0) return;
 
     char model_name[256];
@@ -421,6 +650,28 @@ void c_generate_style_chunked(const char** chunks, int num_chunks, const char* p
         return;
     }
     printf("[+] Model loaded successfully. Processing %d chunks in memory...\n", num_chunks);
+
+    char final_prompt[1024];
+    if (prompt && strlen(prompt) > 0) {
+        strncpy(final_prompt, prompt, sizeof(final_prompt) - 1);
+        final_prompt[sizeof(final_prompt) - 1] = '\0';
+    } else {
+        final_prompt[0] = '\0';
+    }
+
+    if (strstr(final_prompt, "speed") == NULL && strstr(final_prompt, "Speed") == NULL) {
+        if (speed >= 1.25f && strlen(final_prompt) + 20 < sizeof(final_prompt)) {
+            if (strlen(final_prompt) > 0) strcat(final_prompt, ". ");
+            strcat(final_prompt, "speed: Fast-paced.");
+        } else if (speed <= 0.85f && strlen(final_prompt) + 20 < sizeof(final_prompt)) {
+            if (strlen(final_prompt) > 0) strcat(final_prompt, ". ");
+            strcat(final_prompt, "speed: Slow-paced.");
+        }
+    }
+
+    if (fabsf(speed - 1.0f) >= 0.01f) {
+        printf("[*] Speech speed multiplier: %.2fx\n", speed);
+    }
 
     size_t total_samples = 0;
     size_t audio_capacity = 24000 * 60; // 1 minute initial capacity
@@ -465,7 +716,7 @@ void c_generate_style_chunked(const char** chunks, int num_chunks, const char* p
         params.print_progress = 0;
         params.print_timing = 0;
         params.repetition_penalty = 1.05f;
-        params.instruction = (prompt && strlen(prompt) > 0) ? prompt : NULL;
+        params.instruction = (strlen(final_prompt) > 0) ? final_prompt : NULL;
 
         qwen3_tts_result_t result = qwen3_tts_synthesize(ctx, chunks[i], params);
         if (!result.success || result.audio_len <= 0) {
@@ -488,31 +739,33 @@ void c_generate_style_chunked(const char** chunks, int num_chunks, const char* p
                     i + 1, num_chunks, chunk_sec, rtf);
         }
 
-        int silence_samples = (i < num_chunks - 1) ? (int)(sample_rate * 0.25f) : 0;
-        size_t needed = total_samples + result.audio_len + silence_samples;
-        if (needed > audio_capacity) {
-            audio_capacity = needed * 2;
-            float* new_buf = (float*)realloc(full_audio, audio_capacity * sizeof(float));
-            if (!new_buf) {
-                fprintf(stderr, "[-] Error: Failed to reallocate audio buffer\n");
-                qwen3_tts_free_result(result);
-                break;
-            }
-            full_audio = new_buf;
-        }
-
-        memcpy(full_audio + total_samples, result.audio, result.audio_len * sizeof(float));
-        total_samples += result.audio_len;
-
-        if (silence_samples > 0) {
-            memset(full_audio + total_samples, 0, silence_samples * sizeof(float));
-            total_samples += silence_samples;
-        }
+        append_chunk_audio(
+            &full_audio,
+            &total_samples,
+            &audio_capacity,
+            result.audio,
+            result.audio_len,
+            sample_rate,
+            i == num_chunks - 1
+        );
 
         qwen3_tts_free_result(result);
     }
 
     if (total_samples > 0) {
+        if (fabsf(speed - 1.0f) >= 0.01f) {
+            int stretched_len = 0;
+            float* stretched = apply_sola_timestretch(full_audio, (int)total_samples, sample_rate, speed, &stretched_len);
+            if (stretched && stretched_len > 0) {
+                double orig_sec = (double)total_samples / (double)sample_rate;
+                double new_sec = (double)stretched_len / (double)sample_rate;
+                printf("[*] Applied speed multiplier %.2fx: duration %.2fs -> %.2fs\n", speed, orig_sec, new_sec);
+                free(full_audio);
+                full_audio = stretched;
+                total_samples = stretched_len;
+            }
+        }
+
         double total_audio_sec = (double)total_samples / (double)sample_rate;
         printf("\n============================================================\n");
         printf("[+] All %d chunks synthesized successfully!\n", num_chunks);
@@ -533,7 +786,7 @@ void c_generate_style_chunked(const char** chunks, int num_chunks, const char* p
     qwen3_tts_free(ctx);
 }
 
-void c_generate_clone_chunked(const char** chunks, int num_chunks, const char* audio_path, const char* output_path) {
+void c_generate_clone_chunked(const char** chunks, int num_chunks, const char* audio_path, const char* output_path, float speed) {
     if (!chunks || num_chunks <= 0) return;
 
     char model_name[256];
@@ -566,6 +819,9 @@ void c_generate_clone_chunked(const char** chunks, int num_chunks, const char* a
     printf("[+] Model loaded successfully. Processing %d chunks in memory...\n", num_chunks);
 
     printf("[*] Cloning voice from reference audio: %s\n", audio_path);
+    if (fabsf(speed - 1.0f) >= 0.01f) {
+        printf("[*] Speech speed multiplier: %.2fx\n", speed);
+    }
     printf("[*] Extracting speaker embedding...\n");
     fflush(stdout);
 
@@ -634,31 +890,33 @@ void c_generate_clone_chunked(const char** chunks, int num_chunks, const char* a
                     i + 1, num_chunks, chunk_sec, rtf);
         }
 
-        int silence_samples = (i < num_chunks - 1) ? (int)(sample_rate * 0.25f) : 0;
-        size_t needed = total_samples + result.audio_len + silence_samples;
-        if (needed > audio_capacity) {
-            audio_capacity = needed * 2;
-            float* new_buf = (float*)realloc(full_audio, audio_capacity * sizeof(float));
-            if (!new_buf) {
-                fprintf(stderr, "[-] Error: Failed to reallocate audio buffer\n");
-                qwen3_tts_free_result(result);
-                break;
-            }
-            full_audio = new_buf;
-        }
-
-        memcpy(full_audio + total_samples, result.audio, result.audio_len * sizeof(float));
-        total_samples += result.audio_len;
-
-        if (silence_samples > 0) {
-            memset(full_audio + total_samples, 0, silence_samples * sizeof(float));
-            total_samples += silence_samples;
-        }
+        append_chunk_audio(
+            &full_audio,
+            &total_samples,
+            &audio_capacity,
+            result.audio,
+            result.audio_len,
+            sample_rate,
+            i == num_chunks - 1
+        );
 
         qwen3_tts_free_result(result);
     }
 
     if (total_samples > 0) {
+        if (fabsf(speed - 1.0f) >= 0.01f) {
+            int stretched_len = 0;
+            float* stretched = apply_sola_timestretch(full_audio, (int)total_samples, sample_rate, speed, &stretched_len);
+            if (stretched && stretched_len > 0) {
+                double orig_sec = (double)total_samples / (double)sample_rate;
+                double new_sec = (double)stretched_len / (double)sample_rate;
+                printf("[*] Applied speed multiplier %.2fx: duration %.2fs -> %.2fs\n", speed, orig_sec, new_sec);
+                free(full_audio);
+                full_audio = stretched;
+                total_samples = stretched_len;
+            }
+        }
+
         double total_audio_sec = (double)total_samples / (double)sample_rate;
         printf("\n============================================================\n");
         printf("[+] All %d chunks synthesized successfully!\n", num_chunks);
