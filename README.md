@@ -20,6 +20,7 @@
 - [CLI Usage & Command Reference](#cli-usage--command-reference)
   - [1. Voice Design / Acoustic Style (`voicecli style`)](#1-voice-design--acoustic-style-voicecli-style)
   - [2. Zero-Shot Voice Cloning (`voicecli clone`)](#2-zero-shot-voice-cloning-voicecli-clone)
+  - [3. Auto-Chunk Mode for Long Texts (`--chunk`)](#3-auto-chunk-mode---chunk)
 - [Configuration & Settings](#configuration--settings)
   - [Configuration File (`settings.json`)](#configuration-file-settingsjson)
   - [Environment Variables](#environment-variables)
@@ -123,6 +124,11 @@ The entire PyTorch and Python stack has been eliminated. The inference core is b
   - Smooth terminal progress bar with frame counters and estimated audio duration.
   - Automatically detects whether standard error is a TTY (`isatty`), keeping CI/CD and piped logs clean while providing rich interactive output in terminals.
 - **Auto-Setup on First Run**: If model weights are not present locally, `voicecli` automatically fetches the official BF16 GGUF weights directly from Hugging Face with a resumable download progress bar.
+- **Auto-Chunk Mode for Long Texts (`--chunk`)**:
+  - Automatically segment long text files (`--file <PATH.txt>`) or inline text into natural sentence-level chunks (~250–350 characters).
+  - Preserves titles, abbreviations (`Dr.`, `Mr.`, `e.g.`, `etc.`), and paragraph structure.
+  - Keeps the 3.8 GB model resident in memory to synthesize all chunks consecutively without model reload delays.
+  - Inserts 250ms natural breathing pauses between chunks and stitches everything into a single seamless output WAV file.
 - **Zero Audio Processing Dependencies**: Implements a dedicated in-process 16-bit PCM 24 kHz WAV serializer, outputting broadcast-quality audio files directly.
 - **Flexible Configuration**: Fine-tune model selections and paths via `settings.json` or override them on the fly using environment variables.
 
@@ -163,6 +169,15 @@ voicecli/
   --output cloned_voice.wav
 ```
 
+### 4. Synthesize Long Text Files with Auto-Chunking
+```bash
+./voicecli style \
+  --file article.txt \
+  --prompt "gender: Male. pitch: Deep. speed: Normal. tone: Professional." \
+  --chunk \
+  --output full_recording.wav
+```
+
 ---
 
 ## CLI Usage & Command Reference
@@ -187,60 +202,82 @@ Options:
 Generates speech from text guided by natural language prompts describing vocal characteristics, pitch, gender, pacing, or emotional coloring.
 
 ```bash
-voicecli style [OPTIONS] --text <TEXT> --prompt <PROMPT>
+voicecli style [OPTIONS] --prompt <PROMPT> (--text <TEXT> | --file <PATH.txt>)
 ```
 
 #### Arguments & Flags
 
 | Flag | Short | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `--text` | `-t` | *(Required)* | The textual content to convert into speech. |
+| `--text` | `-t` | *None* | The textual content to convert into speech (use either `--text` or `--file`). |
+| `--file` | `-f` | *None* | Path to a `.txt` file containing the text to convert into speech. |
 | `--prompt` | `-p` | *(Required)* | Acoustic style instructions (e.g. gender, pitch, speed, mood). |
 | `--output` | `-o` | `output.wav` | Path where the output 24 kHz `.wav` file will be saved. |
+| `--chunk` | | `false` | **Auto-Chunk Mode**: Automatically split long texts into natural sentence chunks, synthesize in-memory, and stitch into one seamless audio file. |
 
 #### Examples
 
 ```bash
-# Cheerful female assistant
+# Basic voice synthesis
 ./voicecli style \
   -t "Good morning! You have three meetings scheduled for today." \
-  -p "gender: Female. pitch: High. speed: Normal. tone: Cheerful and professional." \
+  -p "gender: Female. pitch: High. speed: Normal. tone: Cheerful." \
   -o morning.wav
 
-# Deep, slow narration
+# Synthesize long text / article from a .txt file with Auto-Chunking
 ./voicecli style \
-  -t "The deep ocean remains one of the most enigmatic frontiers known to science." \
-  -p "gender: Male. pitch: Deep and resonant. speed: Slow. tone: Documentary narration." \
-  -o narration.wav
+  -f article.txt \
+  -p "gender: Male. pitch: Deep. speed: Slow. tone: Documentary narration." \
+  --chunk \
+  -o audiobook_chapter.wav
 ```
 
 ---
 
 ### 2. Zero-Shot Voice Cloning (`voicecli clone`)
 
-Clones an individual speaker's voice using a short reference audio file. The reference sample should ideally be between 3 and 15 seconds long with clear speech and minimal background noise.
+Clones an individual speaker's voice using a short reference audio file (3 to 15 seconds recommended).
 
 ```bash
-voicecli clone [OPTIONS] --text <TEXT> --audio-in <AUDIO_IN>
+voicecli clone [OPTIONS] --audio-in <AUDIO_IN> (--text <TEXT> | --file <PATH.txt>)
 ```
 
 #### Arguments & Flags
 
 | Flag | Short | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `--text` | `-t` | *(Required)* | The textual content to synthesize in the cloned voice. |
+| `--text` | `-t` | *None* | The textual content to synthesize (use either `--text` or `--file`). |
+| `--file` | `-f` | *None* | Path to a `.txt` file containing the text to synthesize. |
 | `--audio-in` | `-a` | *(Required)* | Path to the reference `.wav` audio clip (3–15 seconds). |
 | `--output` | `-o` | `clone_output.wav` | Path where the cloned output `.wav` file will be saved. |
+| `--chunk` | | `false` | **Auto-Chunk Mode**: Automatically split long texts into natural sentence chunks, synthesize in-memory, and stitch into one seamless audio file. |
 
 #### Examples
 
 ```bash
-# Clone a voice using reference sample
+# Clone a voice from reference sample
 ./voicecli clone \
-  --text "This sentence is spoken entirely in the vocal timbre of the reference sample." \
-  --audio-in my_voice_sample.wav \
-  --output cloned_result.wav
+  -t "This sentence is spoken entirely in the vocal timbre of the reference sample." \
+  -a my_voice_sample.wav \
+  -o cloned_result.wav
+
+# Clone a voice for a full document from a .txt file with Auto-Chunking
+./voicecli clone \
+  -f my_notes.txt \
+  -a my_voice_sample.wav \
+  --chunk \
+  -o cloned_full_speech.wav
 ```
+
+---
+
+### 3. Auto-Chunk Mode (`--chunk`)
+
+When synthesizing long text inputs (such as articles, essays, or audiobook chapters):
+- Pass the `--chunk` flag along with `--file <PATH.txt>` or `--text <TEXT>`.
+- `voicecli` intelligently segments the text at sentence and paragraph boundaries (~250–350 characters per chunk) while preserving abbreviations (`Dr.`, `Mr.`, `e.g.`).
+- The 3.8 GB model weights are loaded **once** into memory, synthesizing all chunks consecutively at maximum SIMD speed with zero reload latency.
+- Subtle 250ms silence padding is automatically inserted between chunks for a natural human speaking cadence, stitching everything into a single, unified output `.wav` file.
 
 ---
 
@@ -370,6 +407,16 @@ By default, `voicecli` places downloaded models in the `models/` directory or di
 
 ### Q: Why is my terminal progress bar showing multiple lines in CI/CD?
 In non-interactive environments where `stderr` is not an interactive terminal (e.g. piped to `grep` or running in a CI runner), `voicecli` detects that `isatty(fileno(stderr))` is false and automatically switches from ANSI line-clearing updates to periodic milestone logging every 20 frames.
+
+### Q: Is there a maximum text length limit?
+In single-pass mode (without `--chunk`), generation is budgeted up to 4,096 audio frames (~5.7 minutes of speech, or ~850 words). If your input exceeds this, generation gracefully finalizes at the 5.7-minute mark.  
+**To synthesize arbitrarily long texts (such as full articles, essays, or audiobook chapters), pass the `--chunk` flag.** Auto-Chunk Mode will split the text into natural sentence-level chunks, process them consecutively with the model resident in memory, and stitch the entire recording into a single, seamless WAV file.
+
+### Q: How do I synthesize an audiobook or article from a `.txt` file?
+Place your text in a `.txt` file and run:
+```bash
+./voicecli style --file chapter1.txt --prompt "gender: Male. pitch: Deep. speed: Normal. tone: Expressive narration." --chunk --output chapter1.wav
+```
 
 ### Q: Can I interrupt generation safely?
 Yes. Sending `Ctrl+C` cleanly terminates the process immediately without leaving dangling background threads or child processes.
