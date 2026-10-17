@@ -6,7 +6,7 @@ fn main() {
     let ext_dir = PathBuf::from(&project_dir).join("external").join("qwen3-tts");
     let mut build_dir = ext_dir.join("build-static");
 
-    // If build-static doesn't exist, check build or tmp
+    // If build-static doesn't exist, check build or compile from source
     if !build_dir.join("libqwen3_tts.a").exists() {
         if ext_dir.join("build").join("libqwen3_tts.a").exists() {
             build_dir = ext_dir.join("build");
@@ -47,8 +47,22 @@ fn main() {
                 panic!("cmake configure failed");
             }
 
+            let n_jobs = std::thread::available_parallelism()
+                .map(|n| n.get().to_string())
+                .unwrap_or_else(|_| "4".to_string());
+
+            // Build only the required static libraries instead of test/CLI binaries
             let status = Command::new("cmake")
-                .args(["--build", b_dir.to_str().unwrap(), "--config", "Release", "-j4"])
+                .args([
+                    "--build",
+                    b_dir.to_str().unwrap(),
+                    "--config",
+                    "Release",
+                    "--target",
+                    "qwen3_tts",
+                    "-j",
+                    &n_jobs,
+                ])
                 .status()
                 .expect("Failed to build cmake");
             if !status.success() {
@@ -58,12 +72,22 @@ fn main() {
         }
     }
 
-    // Compile src/model.c with includes for qwen3_tts_c.h
+    // Compile src/model.c with high-performance optimization flags and includes for qwen3_tts_c.h
     let mut c_builder = cc::Build::new();
     c_builder
         .file("src/model.c")
         .include(ext_dir.join("src"))
-        .include(ext_dir.join("ggml").join("include"));
+        .include(ext_dir.join("ggml").join("include"))
+        .opt_level(3);
+
+    let compiler = c_builder.get_compiler();
+    if compiler.is_like_gnu() || compiler.is_like_clang() {
+        c_builder.flag_if_supported("-O3");
+        c_builder.flag_if_supported("-ffast-math");
+        c_builder.flag_if_supported("-funroll-loops");
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        c_builder.flag_if_supported("-march=native");
+    }
     c_builder.compile("model");
 
     // Link all static GGML and Qwen3-TTS libraries directly into voicecli

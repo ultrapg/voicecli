@@ -1,6 +1,7 @@
 {
   "model_name_style": "qwen-talker-1.7b-voicedesign-BF16.gguf",
   "model_name_clone": "qwen-talker-1.7b-base-BF16.gguf",
+  "model_name_speak": "qwen-talker-1.7b-customvoice-BF16.gguf",
   "tokenizer_model": "qwen-tokenizer-12hz-BF16.gguf",
   "device": "cpu",
   "dtype": "bfloat16",
@@ -8,5 +9,6 @@
   "top_p": 1.0,
   "top_k": 50,
   "max_tokens": 4096,
-  "repetition_penalty": 1.05
+  "repetition_penalty": 1.05,
+  "language": "auto"
 }
