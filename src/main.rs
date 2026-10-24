@@ -156,7 +156,7 @@ struct CommonSynthArgs {
 
 #[derive(Parser)]
 #[command(name = "voicecli")]
-#[command(version = "0.3.0")]
+#[command(version = "0.3.1")]
 #[command(author = "Antigravity")]
 #[command(
     about = "High-Performance Native Qwen3-TTS CLI (Rust + C/C++ GGML)",

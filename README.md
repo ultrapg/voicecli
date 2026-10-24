@@ -10,6 +10,21 @@
 
 ---
 
+## What's New in v0.3.1
+
+- **Fixed `SIGILL` (`Illegal instruction` / `Ungültiger Maschinenbefehl`) Crash on Non-AVX-512 CPUs**:
+  - Removed host-specific `-march=native` flags from `qwen3-tts.cpp`, `ggml`, `build.rs`, and Rust codegen that previously leaked AVX-512 (`EVEX`) instructions into C++ `.init_array` global constructors when built on AVX-512 servers (crashing immediately on startup even for `voicecli -h`).
+  - All CLI, tokenizer, transformer graph setup, and startup code now compiles strictly to baseline `x86-64` (SSE2), guaranteeing zero illegal-instruction faults on any 64-bit x86 processor.
+- **Single-Binary Multi-ISA Runtime CPU Dispatch (`src/cpu_dispatch.c`)**:
+  - Embeds four isolated static GGML CPU tensor backends directly inside the single binary and automatically selects the fastest instruction set supported by both the CPU (`CPUID`) and OS (`XGETBV` / `XCR0`) at runtime:
+    1. **AVX-512 (`x86-64-v4`)** — AMD Zen 4/5, Intel Skylake-X / Ice Lake / Sapphire Rapids
+    2. **AVX2 + FMA + F16C (`x86-64-v3`)** — Intel Haswell–Core Ultra, AMD Ryzen Zen 1–3
+    3. **SSE4.2 (`x86-64-v2`)** — Older Intel Nehalem–Ivy Bridge & low-power Celeron/Pentium CPUs
+    4. **Baseline `x86-64` (SSE2)** — Universal 64-bit x86 fallback
+  - Inspect the active detected SIMD backend anytime via `voicecli models`, override at runtime with `VOICECLI_SIMD=x64|sse42|avx2|avx512`, or opt into host-specific native compilation when building locally with `VOICECLI_NATIVE=1`.
+
+---
+
 ## What's New in v0.3.0
 
 - **Full In-Context Learning (ICL) Voice Cloning (`--ref-text` / `--ref-file`)**: Supply the transcript of your reference audio during `voicecli clone` or `voicecli profile` to extract both the 2048D speaker embedding AND the 12Hz reference acoustic speech codes for dramatically higher voice similarity and prosodic fidelity.
@@ -59,19 +74,19 @@
 
 `voicecli` is a high-performance command-line interface for **Qwen3-TTS**, Alibaba Cloud's state-of-the-art text-to-speech and voice-cloning model family.
 
-The entire PyTorch and Python stack has been eliminated. The inference core is built directly on native C/C++ utilizing **GGML** tensor primitives with hardware-accelerated SIMD instructions (AVX2, AVX512, FMA, NEON). The result is a single, self-contained executable (~3.8 MB) that runs anywhere on Linux x86_64 without installing Python or deep learning frameworks.
+The entire PyTorch and Python stack has been eliminated. The inference core is built directly on native C/C++ utilizing **GGML** tensor primitives with runtime-dispatched hardware SIMD instructions (AVX-512, AVX2 + FMA + F16C, SSE4.2, Baseline SSE2, NEON). The result is a single, self-contained executable (~5.7 MB) that runs on any 64-bit Linux x86_64 CPU without installing Python or deep learning frameworks.
 
 ---
 
 ## The Re-Engineering: Python / PyTorch vs. Native GGML
 
-| Metric / Feature | Original Python / PyTorch Implementation | Native Single-Binary Architecture (`v0.3.0`) |
+| Metric / Feature | Original Python / PyTorch Implementation | Native Single-Binary Architecture (`v0.3.1`) |
 | :--- | :--- | :--- |
 | **Runtime Dependencies** | Python 3.11, PyTorch, Torchaudio, Transformers, PyO3, LibCUDA | **None** (Statically linked single binary) |
-| **Distribution Package Size** | Multi-GB folder or complex virtualenv bundle | **~1.6 MB** (`voicecli-linux-x86_64.tar.gz`) |
-| **Binary Executable Size** | Fragile wrapper DLLs + hundreds of shared `.so` files | **~3.8 MB single unified binary** |
+| **Distribution Package Size** | Multi-GB folder or complex virtualenv bundle | **~2.5 MB** (`voicecli-linux-x86_64.tar.gz`) |
+| **Binary Executable Size** | Fragile wrapper DLLs + hundreds of shared `.so` files | **~5.7 MB single unified multi-ISA binary** |
 | **Cold-Start Time** | 10 – 20+ seconds (Python interpreter + PyTorch init) | **Sub-second startup** + direct model memory mapping |
-| **Hardware Acceleration** | Requires CUDA GPU or heavy PyTorch CPU backend | **Native CPU SIMD (AVX2, AVX-512, FMA) via GGML** |
+| **Hardware Acceleration** | Requires CUDA GPU or heavy PyTorch CPU backend | **Multi-ISA Runtime CPU Dispatch (`x86-64` / `SSE4.2` / `AVX2` / `AVX-512`)** |
 | **Model Support** | Single precision only | **BF16, Q8_0, Q4_K_M (1.7B & 0.6B presets)** |
 | **Voice Cloning Modes** | Basic speaker embedding | **Speaker Embedding + Full In-Context Learning (ICL) + Cached Profiles** |
 | **Audio Writing Pipeline** | `scipy.io.wavfile` / `soundfile` / `torchaudio` | **64 KB buffered native 24 kHz 16-bit PCM WAV writer + stdout piping** |
@@ -259,7 +274,7 @@ voicecli models --download q8
 
 `voicecli` resolves configuration in the following priority order:
 1. **CLI Flags** (Highest precedence)
-2. **Environment Variables** (`VOICECLI_MODEL_DIR`, `VOICECLI_MODEL_NAME_STYLE`, `VOICECLI_MODEL_NAME_CLONE`, `VOICECLI_MODEL_NAME_SPEAK`, `VOICECLI_TOKENIZER_MODEL`, `VOICECLI_LANGUAGE`, `VOICECLI_TEMPERATURE`, `VOICECLI_TOP_P`, `VOICECLI_TOP_K`, `VOICECLI_MAX_TOKENS`, `VOICECLI_REPETITION_PENALTY`)
+2. **Environment Variables** (`VOICECLI_MODEL_DIR`, `VOICECLI_MODEL_NAME_STYLE`, `VOICECLI_MODEL_NAME_CLONE`, `VOICECLI_MODEL_NAME_SPEAK`, `VOICECLI_TOKENIZER_MODEL`, `VOICECLI_LANGUAGE`, `VOICECLI_TEMPERATURE`, `VOICECLI_TOP_P`, `VOICECLI_TOP_K`, `VOICECLI_MAX_TOKENS`, `VOICECLI_REPETITION_PENALTY`, `VOICECLI_SIMD`)
 3. **`settings.json`** (Located in the working directory or beside the executable)
 4. **Built-in Defaults**
 
@@ -312,6 +327,9 @@ Or build directly with Cargo:
 git clone --recursive https://github.com/Danmoreng/qwen3-tts.cpp.git external/qwen3-tts
 cargo test
 cargo build --release
+
+# Optional: build strictly for your local host CPU (-march=native) instead of portable multi-ISA
+VOICECLI_NATIVE=1 cargo build --release
 ```
 
 ---

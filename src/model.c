@@ -12,6 +12,8 @@
 #endif
 #include "qwen3_tts_c.h"
 
+extern const char* voicecli_get_active_simd_name(void);
+
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -897,7 +899,7 @@ int c_generate_style_ex(const char* text, const char* prompt, const voicecli_opt
     resolve_model_preset("style", opts ? opts->model_override : NULL, model_name, sizeof(model_name));
 
     fprintf(stderr, "[*] Loading model: %s ...\n", model_name);
-    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD)\n");
+    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD: %s)\n", voicecli_get_active_simd_name());
 
     const char* model_dir = resolve_model_dir();
     char tok_name[256];
@@ -1004,7 +1006,7 @@ int c_generate_style_chunked_ex(const char** chunks, int num_chunks, const char*
     resolve_model_preset("style", opts ? opts->model_override : NULL, model_name, sizeof(model_name));
 
     fprintf(stderr, "[*] [Auto-Chunk] Loading model: %s ...\n", model_name);
-    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD)\n");
+    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD: %s)\n", voicecli_get_active_simd_name());
 
     const char* model_dir = resolve_model_dir();
     char tok_name[256];
@@ -1197,7 +1199,7 @@ int c_generate_clone_ex(const char* text, const char* audio_path, const voicecli
     resolve_model_preset("clone", opts ? opts->model_override : NULL, model_name, sizeof(model_name));
 
     fprintf(stderr, "[*] Loading model: %s ...\n", model_name);
-    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD)\n");
+    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD: %s)\n", voicecli_get_active_simd_name());
 
     const char* model_dir = resolve_model_dir();
     char tok_name[256];
@@ -1310,7 +1312,7 @@ int c_generate_clone_chunked_ex(const char** chunks, int num_chunks, const char*
     resolve_model_preset("clone", opts ? opts->model_override : NULL, model_name, sizeof(model_name));
 
     fprintf(stderr, "[*] [Auto-Chunk] Loading model: %s ...\n", model_name);
-    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD)\n");
+    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD: %s)\n", voicecli_get_active_simd_name());
 
     const char* model_dir = resolve_model_dir();
     char tok_name[256];
@@ -1504,7 +1506,7 @@ int c_generate_speak_ex(const char* text, const char* speaker, const char* promp
     resolve_model_preset("speak", opts ? opts->model_override : NULL, model_name, sizeof(model_name));
 
     fprintf(stderr, "[*] Loading CustomVoice model: %s ...\n", model_name);
-    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD)\n");
+    fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD: %s)\n", voicecli_get_active_simd_name());
 
     const char* model_dir = resolve_model_dir();
     char tok_name[256];
@@ -1773,7 +1775,8 @@ void c_print_system_info(void) {
     printf("============================================================\n");
     printf("  Model Directory     : %s\n", model_dir);
     printf("  Default CPU Threads : %d\n", threads);
-    printf("  Compiled Backends   : CPU (SIMD)%s\n", (backend_mask & 2) ? ", CUDA" : "");
+    printf("  Active CPU SIMD     : %s\n", voicecli_get_active_simd_name());
+    printf("  Compiled Backends   : CPU (Multi-ISA Runtime Dispatch)%s\n", (backend_mask & 2) ? ", CUDA" : "");
     printf("  Configured Models   :\n");
     printf("    - Style (Design)  : %s\n", style_model);
     printf("    - Clone (Base)    : %s\n", clone_model);
