@@ -1,0 +1,105 @@
+#pragma once
+
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+struct ggml_context;
+struct ggml_tensor;
+struct ggml_cgraph;
+
+namespace qwen3_tts {
+
+struct audio_decoder_private;
+namespace decoder_internal {
+struct ops;
+}
+
+using audio_decoder_progress_callback_t =
+    std::function<void(int32_t frames_completed, int32_t total_frames)>;
+
+struct audio_decoder_timing {
+    int64_t graph_build_ms = 0;
+    int64_t graph_alloc_ms = 0;
+    int64_t input_upload_ms = 0;
+    int64_t graph_compute_ms = 0;
+    int64_t output_read_ms = 0;
+    int64_t total_ms = 0;
+    int32_t graph_rebuilt = 0;
+    int32_t n_frames = 0;
+    int64_t n_samples = 0;
+};
+
+// Audio tokenizer decoder (vocoder) configuration
+struct audio_decoder_config {
+    int32_t sample_rate = 24000;
+    int32_t n_codebooks = 16;           // Total codebooks (1 first + 15 rest)
+    int32_t codebook_size = 2048;       // Entries per codebook
+    int32_t codebook_dim = 256;         // Embedding dimension per codebook
+    int32_t latent_dim = 1024;          // Latent dimension after VQ
+    int32_t hidden_dim = 512;           // Pre-transformer hidden dimension
+    int32_t n_pre_tfm_layers = 8;       // Pre-transformer layers
+    int32_t n_heads = 16;               // Attention heads in pre-transformer
+    int32_t ffn_dim = 1024;             // FFN intermediate dimension
+    int32_t sliding_window = 72;         // Causal attention window in codec frames
+    int32_t decoder_dim = 1536;         // Initial decoder dimension
+    int32_t upsample_rates[4] = {8, 5, 4, 3};  // Total: 480x upsampling
+    float rms_norm_eps = 1e-5f;
+    float rope_theta = 10000.0f;
+};
+
+// Audio tokenizer decoder (vocoder) class
+// Decodes discrete audio codes to waveform
+class AudioTokenizerDecoder {
+public:
+    AudioTokenizerDecoder();
+    ~AudioTokenizerDecoder();
+    
+    // Load model from GGUF file (tokenizer model)
+    bool load_model(const std::string & model_path);
+
+    // Load model with a dedicated backend handle. This is useful when the
+    // decoder is interleaved with another long-lived CUDA scheduler.
+    bool load_model_dedicated(const std::string & model_path);
+
+    // Release all model/runtime resources
+    void unload_model();
+    
+    // Decode audio codes to waveform
+    // codes: audio codes [n_frames, n_codebooks] as int32_t (row-major)
+    // n_frames: number of frames
+    // Returns: audio samples normalized to [-1, 1] at 24kHz
+    bool decode(const int32_t * codes, int32_t n_frames,
+                std::vector<float> & samples,
+                const audio_decoder_progress_callback_t * on_progress = nullptr);
+
+    // Reset and incrementally advance the causal streaming decoder. Each
+    // decode_stream() call consumes only fresh codec frames and returns
+    // exactly n_frames * 1920 new samples.
+    bool reset_stream();
+    bool prime_stream(const int32_t * codes, int32_t n_frames,
+                      std::vector<float> & scratch_samples);
+    bool decode_stream(const int32_t * codes, int32_t n_frames,
+                       std::vector<float> & samples);
+
+    // Drop the cached decode graph. Streaming may call this between chunks on
+    // CUDA backends to avoid reusing a graph with short rolling windows.
+    void clear_decode_cache();
+    
+    const audio_decoder_config & get_config() const;
+    
+    const std::string & get_error() const;
+
+    const audio_decoder_timing & get_last_timing() const;
+    
+private:
+    friend struct decoder_internal::ops;
+
+    bool load_model_impl(const std::string & model_path, bool shared_backend);
+
+    std::unique_ptr<audio_decoder_private> impl_;
+};
+
+} // namespace qwen3_tts

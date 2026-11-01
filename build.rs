@@ -2,6 +2,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const QWEN3_TTS_PINNED_COMMIT: &str = "16bb5afcd06311031c72a8488f8d59660dc2fb46";
+
 fn ensure_qwen3_tts_source(ext_dir: &Path, native_opt: bool) {
     let cmake_file = ext_dir.join("CMakeLists.txt");
     if !cmake_file.exists() {
@@ -12,9 +14,6 @@ fn ensure_qwen3_tts_source(ext_dir: &Path, native_opt: bool) {
         let status = Command::new("git")
             .args([
                 "clone",
-                "--depth",
-                "1",
-                "--recursive",
                 "https://github.com/Danmoreng/qwen3-tts.cpp.git",
                 ext_dir.to_str().unwrap(),
             ])
@@ -22,6 +21,31 @@ fn ensure_qwen3_tts_source(ext_dir: &Path, native_opt: bool) {
             .expect("Failed to clone qwen3-tts.cpp");
         if !status.success() {
             panic!("git clone failed");
+        }
+
+        let checkout_status = Command::new("git")
+            .current_dir(ext_dir)
+            .args(["checkout", QWEN3_TTS_PINNED_COMMIT])
+            .status()
+            .expect("Failed to checkout pinned qwen3-tts.cpp commit");
+        if !checkout_status.success() {
+            panic!("git checkout {} failed", QWEN3_TTS_PINNED_COMMIT);
+        }
+
+        let sub_status = Command::new("git")
+            .current_dir(ext_dir)
+            .args(["submodule", "update", "--init", "--recursive", "--depth", "1"])
+            .status()
+            .expect("Failed to initialize qwen3-tts.cpp submodules");
+        if !sub_status.success() {
+            let fallback = Command::new("git")
+                .current_dir(ext_dir)
+                .args(["submodule", "update", "--init", "--recursive"])
+                .status()
+                .expect("Failed to initialize qwen3-tts.cpp submodules");
+            if !fallback.success() {
+                panic!("git submodule update failed");
+            }
         }
     }
 
@@ -41,6 +65,38 @@ fn ensure_qwen3_tts_source(ext_dir: &Path, native_opt: bool) {
     }
 }
 
+fn sync_engine_overlay_dir(src_dir: &Path, dst_dir: &Path) {
+    let entries = match std::fs::read_dir(src_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    println!("cargo:rerun-if-changed={}", src_dir.display());
+    for entry in entries.flatten() {
+        let src_path = entry.path();
+        let file_name = entry.file_name();
+        let dst_path = dst_dir.join(file_name);
+        if src_path.is_dir() {
+            sync_engine_overlay_dir(&src_path, &dst_path);
+        } else if src_path.is_file() {
+            println!("cargo:rerun-if-changed={}", src_path.display());
+            let new_bytes = std::fs::read(&src_path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {}", src_path.display(), e));
+            let needs_write = match std::fs::read(&dst_path) {
+                Ok(old_bytes) => old_bytes != new_bytes,
+                Err(_) => true,
+            };
+            if needs_write {
+                if let Some(parent) = dst_path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .unwrap_or_else(|e| panic!("Failed to mkdir {}: {}", parent.display(), e));
+                }
+                std::fs::write(&dst_path, &new_bytes)
+                    .unwrap_or_else(|e| panic!("Failed to write {}: {}", dst_path.display(), e));
+            }
+        }
+    }
+}
+
 fn run_cmake_configure_and_build(
     src_dir: &Path,
     build_dir: &Path,
@@ -49,20 +105,33 @@ fn run_cmake_configure_and_build(
     extra_cmake_args: &[&str],
 ) {
     let _ = std::fs::create_dir_all(build_dir);
-    let mut cfg = Command::new("cmake");
-    cfg.args([
-        "-S",
-        src_dir.to_str().unwrap(),
-        "-B",
-        build_dir.to_str().unwrap(),
-        "-DCMAKE_BUILD_TYPE=Release",
-        "-DBUILD_SHARED_LIBS=OFF",
-    ]);
-    cfg.args(extra_cmake_args);
+    let marker_path = build_dir.join("voicecli_cmake_args.txt");
+    let expected_marker = format!("target={}\nargs={}\n", target, extra_cmake_args.join("\n"));
+    let cache_exists = build_dir.join("CMakeCache.txt").exists();
+    let marker_matches = std::fs::read_to_string(&marker_path)
+        .map(|s| s == expected_marker)
+        .unwrap_or(false);
 
-    let status = cfg.status().expect("Failed to configure cmake");
-    if !status.success() {
-        panic!("cmake configure failed in {}", build_dir.display());
+    if !cache_exists || !marker_matches {
+        // Remove stale CMakeCache.txt when flags change so cached option() values update cleanly.
+        let _ = std::fs::remove_file(build_dir.join("CMakeCache.txt"));
+        let mut cfg = Command::new("cmake");
+        cfg.args([
+            "-S",
+            src_dir.to_str().unwrap(),
+            "-B",
+            build_dir.to_str().unwrap(),
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DBUILD_SHARED_LIBS=OFF",
+        ]);
+        cfg.args(extra_cmake_args);
+
+        let status = cfg.status().expect("Failed to configure cmake");
+        if !status.success() {
+            panic!("cmake configure failed in {}", build_dir.display());
+        }
+        std::fs::write(&marker_path, expected_marker)
+            .expect("Failed to write voicecli_cmake_args.txt");
     }
 
     let status = Command::new("cmake")
@@ -83,7 +152,26 @@ fn run_cmake_configure_and_build(
     }
 }
 
+fn archive_needs_prefix(src_archive: &Path, dst_archive: &Path) -> bool {
+    let dst_meta = match std::fs::metadata(dst_archive) {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+    let src_meta = match std::fs::metadata(src_archive) {
+        Ok(m) => m,
+        Err(_) => return true,
+    };
+    match (src_meta.modified(), dst_meta.modified()) {
+        (Ok(src_t), Ok(dst_t)) => src_t > dst_t,
+        _ => true,
+    }
+}
+
 fn prefix_ggml_cpu_archive(src_archive: &Path, dst_archive: &Path, prefix: &str, work_dir: &Path) {
+    if !archive_needs_prefix(src_archive, dst_archive) {
+        return;
+    }
+
     // Safety verification: ensure no static C++ constructors (.init_array / .ctors)
     // exist inside libggml-cpu.a that could execute before runtime CPUID dispatch.
     if let Ok(readelf_out) = Command::new("readelf")
@@ -193,8 +281,19 @@ fn prefix_ggml_cpu_archive(src_archive: &Path, dst_archive: &Path, prefix: &str,
     }
 }
 
+fn compiler_supports_flag(compiler: &cc::Tool, flag: &str) -> bool {
+    Command::new(compiler.path())
+        .args([flag, "-x", "c", "-", "-c", "-o", "/dev/null"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn main() {
-    let project_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let project_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
@@ -204,8 +303,14 @@ fn main() {
 
     let multi_isa_x86 = target_arch == "x86_64" && target_os == "linux" && !native_opt;
 
-    let ext_dir = PathBuf::from(&project_dir).join("external").join("qwen3-tts");
+    let ext_dir = project_dir.join("external").join("qwen3-tts");
     ensure_qwen3_tts_source(&ext_dir, native_opt);
+
+    let engine_overlay_dir = project_dir.join("engine");
+    println!("cargo:rerun-if-changed={}", engine_overlay_dir.display());
+    if engine_overlay_dir.exists() {
+        sync_engine_overlay_dir(&engine_overlay_dir, &ext_dir);
+    }
 
     let n_jobs = std::thread::available_parallelism()
         .map(|n| n.get().to_string())
@@ -220,12 +325,17 @@ fn main() {
         let x64_lib = libs_dir.join("libggml-cpu-x64.a");
         let sse42_lib = libs_dir.join("libggml-cpu-sse42.a");
         let avx2_lib = libs_dir.join("libggml-cpu-avx2.a");
+        let avx2_vnni_lib = libs_dir.join("libggml-cpu-avx2-vnni.a");
         let avx512_lib = libs_dir.join("libggml-cpu-avx512.a");
+        let avx512_vnni_lib = libs_dir.join("libggml-cpu-avx512-vnni.a");
+        let avx512_bf16_lib = libs_dir.join("libggml-cpu-avx512-bf16.a");
 
-        if !base_dir.join("libqwen3_tts.a").exists() || !x64_lib.exists() {
-            println!("cargo:warning=Building portable baseline x86-64 Qwen3-TTS + GGML engine...");
+        {
             let base_flags = [
                 "-DGGML_NATIVE=OFF",
+                "-DGGML_OPENMP=OFF",
+                "-DGGML_LLAMAFILE=ON",
+                "-DGGML_CPU_REPACK=ON",
                 "-DGGML_SSE42=OFF",
                 "-DGGML_AVX=OFF",
                 "-DGGML_AVX_VNNI=OFF",
@@ -252,11 +362,13 @@ fn main() {
             );
         }
 
-        if !sse42_lib.exists() {
-            println!("cargo:warning=Building GGML CPU backend variant: SSE4.2 (x86-64-v2)...");
+        {
             let d = portable_root.join("sse42");
             let flags = [
                 "-DGGML_NATIVE=OFF",
+                "-DGGML_OPENMP=OFF",
+                "-DGGML_LLAMAFILE=ON",
+                "-DGGML_CPU_REPACK=ON",
                 "-DGGML_SSE42=ON",
                 "-DGGML_AVX=OFF",
                 "-DGGML_AVX_VNNI=OFF",
@@ -283,11 +395,13 @@ fn main() {
             );
         }
 
-        if !avx2_lib.exists() {
-            println!("cargo:warning=Building GGML CPU backend variant: AVX2 + FMA + F16C (x86-64-v3)...");
+        {
             let d = portable_root.join("avx2");
             let flags = [
                 "-DGGML_NATIVE=OFF",
+                "-DGGML_OPENMP=OFF",
+                "-DGGML_LLAMAFILE=ON",
+                "-DGGML_CPU_REPACK=ON",
                 "-DGGML_SSE42=ON",
                 "-DGGML_AVX=ON",
                 "-DGGML_AVX_VNNI=OFF",
@@ -314,11 +428,46 @@ fn main() {
             );
         }
 
-        if !avx512_lib.exists() {
-            println!("cargo:warning=Building GGML CPU backend variant: AVX-512 (x86-64-v4)...");
+        {
+            let d = portable_root.join("avx2_vnni");
+            let flags = [
+                "-DGGML_NATIVE=OFF",
+                "-DGGML_OPENMP=OFF",
+                "-DGGML_LLAMAFILE=ON",
+                "-DGGML_CPU_REPACK=ON",
+                "-DGGML_SSE42=ON",
+                "-DGGML_AVX=ON",
+                "-DGGML_AVX_VNNI=ON",
+                "-DGGML_AVX2=ON",
+                "-DGGML_BMI2=ON",
+                "-DGGML_FMA=ON",
+                "-DGGML_F16C=ON",
+                "-DGGML_AVX512=OFF",
+                "-DGGML_AVX512_VBMI=OFF",
+                "-DGGML_AVX512_VNNI=OFF",
+                "-DGGML_AVX512_BF16=OFF",
+                "-DGGML_AMX_TILE=OFF",
+                "-DGGML_AMX_INT8=OFF",
+                "-DGGML_AMX_BF16=OFF",
+                "-DCMAKE_C_FLAGS=-march=x86-64 -msse4.2 -mpopcnt -mavx -mf16c -mfma -mbmi -mbmi2 -mavx2 -mavxvnni -mtune=generic",
+                "-DCMAKE_CXX_FLAGS=-march=x86-64 -msse4.2 -mpopcnt -mavx -mf16c -mfma -mbmi -mbmi2 -mavx2 -mavxvnni -mtune=generic",
+            ];
+            run_cmake_configure_and_build(&ext_dir, &d, "ggml-cpu", &n_jobs, &flags);
+            prefix_ggml_cpu_archive(
+                &d.join("ggml").join("src").join("libggml-cpu.a"),
+                &avx2_vnni_lib,
+                "voicecli_avx2_vnni_",
+                &libs_dir,
+            );
+        }
+
+        {
             let d = portable_root.join("avx512");
             let flags = [
                 "-DGGML_NATIVE=OFF",
+                "-DGGML_OPENMP=OFF",
+                "-DGGML_LLAMAFILE=ON",
+                "-DGGML_CPU_REPACK=ON",
                 "-DGGML_SSE42=ON",
                 "-DGGML_AVX=ON",
                 "-DGGML_AVX_VNNI=OFF",
@@ -345,19 +494,100 @@ fn main() {
             );
         }
 
+        {
+            let d = portable_root.join("avx512_vnni");
+            let flags = [
+                "-DGGML_NATIVE=OFF",
+                "-DGGML_OPENMP=OFF",
+                "-DGGML_LLAMAFILE=ON",
+                "-DGGML_CPU_REPACK=ON",
+                "-DGGML_SSE42=ON",
+                "-DGGML_AVX=ON",
+                "-DGGML_AVX_VNNI=OFF",
+                "-DGGML_AVX2=ON",
+                "-DGGML_BMI2=ON",
+                "-DGGML_FMA=ON",
+                "-DGGML_F16C=ON",
+                "-DGGML_AVX512=ON",
+                "-DGGML_AVX512_VBMI=ON",
+                "-DGGML_AVX512_VNNI=ON",
+                "-DGGML_AVX512_BF16=OFF",
+                "-DGGML_AMX_TILE=OFF",
+                "-DGGML_AMX_INT8=OFF",
+                "-DGGML_AMX_BF16=OFF",
+                "-DCMAKE_C_FLAGS=-march=x86-64 -msse4.2 -mpopcnt -mavx -mf16c -mfma -mbmi -mbmi2 -mavx2 -mavx512f -mavx512cd -mavx512vl -mavx512dq -mavx512bw -mavx512vbmi -mavx512vnni -mtune=generic",
+                "-DCMAKE_CXX_FLAGS=-march=x86-64 -msse4.2 -mpopcnt -mavx -mf16c -mfma -mbmi -mbmi2 -mavx2 -mavx512f -mavx512cd -mavx512vl -mavx512dq -mavx512bw -mavx512vbmi -mavx512vnni -mtune=generic",
+            ];
+            run_cmake_configure_and_build(&ext_dir, &d, "ggml-cpu", &n_jobs, &flags);
+            prefix_ggml_cpu_archive(
+                &d.join("ggml").join("src").join("libggml-cpu.a"),
+                &avx512_vnni_lib,
+                "voicecli_avx512_vnni_",
+                &libs_dir,
+            );
+        }
+
+        {
+            let d = portable_root.join("avx512_bf16");
+            let flags = [
+                "-DGGML_NATIVE=OFF",
+                "-DGGML_OPENMP=OFF",
+                "-DGGML_LLAMAFILE=ON",
+                "-DGGML_CPU_REPACK=ON",
+                "-DGGML_SSE42=ON",
+                "-DGGML_AVX=ON",
+                "-DGGML_AVX_VNNI=OFF",
+                "-DGGML_AVX2=ON",
+                "-DGGML_BMI2=ON",
+                "-DGGML_FMA=ON",
+                "-DGGML_F16C=ON",
+                "-DGGML_AVX512=ON",
+                "-DGGML_AVX512_VBMI=ON",
+                "-DGGML_AVX512_VNNI=ON",
+                "-DGGML_AVX512_BF16=ON",
+                "-DGGML_AMX_TILE=OFF",
+                "-DGGML_AMX_INT8=OFF",
+                "-DGGML_AMX_BF16=OFF",
+                "-DCMAKE_C_FLAGS=-march=x86-64 -msse4.2 -mpopcnt -mavx -mf16c -mfma -mbmi -mbmi2 -mavx2 -mavx512f -mavx512cd -mavx512vl -mavx512dq -mavx512bw -mavx512vbmi -mavx512vnni -mavx512bf16 -mtune=generic",
+                "-DCMAKE_CXX_FLAGS=-march=x86-64 -msse4.2 -mpopcnt -mavx -mf16c -mfma -mbmi -mbmi2 -mavx2 -mavx512f -mavx512cd -mavx512vl -mavx512dq -mavx512bw -mavx512vbmi -mavx512vnni -mavx512bf16 -mtune=generic",
+            ];
+            run_cmake_configure_and_build(&ext_dir, &d, "ggml-cpu", &n_jobs, &flags);
+            prefix_ggml_cpu_archive(
+                &d.join("ggml").join("src").join("libggml-cpu.a"),
+                &avx512_bf16_lib,
+                "voicecli_avx512_bf16_",
+                &libs_dir,
+            );
+        }
+
         let ggml_src = base_dir.join("ggml").join("src");
         (base_dir, ggml_src, Some(libs_dir))
     } else {
         let dir_name = if native_opt { "build-native" } else { "build-static-portable" };
         let b_dir = ext_dir.join(dir_name);
-        if !b_dir.join("libqwen3_tts.a").exists() {
-            println!("cargo:warning=Building static GGML engine with cmake ({})...", dir_name);
-            let mut extra = Vec::new();
-            if !native_opt {
-                extra.push("-DGGML_NATIVE=OFF");
+        let probe_cc = cc::Build::new().get_compiler();
+        let mut extra: Vec<String> = vec![
+            "-DGGML_OPENMP=OFF".to_string(),
+            "-DGGML_LLAMAFILE=ON".to_string(),
+            "-DGGML_CPU_REPACK=ON".to_string(),
+        ];
+        if !native_opt {
+            extra.push("-DGGML_NATIVE=OFF".to_string());
+            if target_arch == "aarch64" {
+                if target_os == "macos" {
+                    // All Apple Silicon (M1+) supports armv8.4-a+dotprod+fp16
+                    if compiler_supports_flag(&probe_cc, "-march=armv8.2-a+dotprod+fp16") {
+                        extra.push("-DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16".to_string());
+                    }
+                } else if compiler_supports_flag(&probe_cc, "-march=armv8-a") {
+                    extra.push("-DGGML_CPU_ARM_ARCH=armv8-a".to_string());
+                }
             }
-            run_cmake_configure_and_build(&ext_dir, &b_dir, "qwen3_tts", &n_jobs, &extra);
+        } else {
+            extra.push("-DGGML_NATIVE=ON".to_string());
         }
+        let extra_refs: Vec<&str> = extra.iter().map(|s| s.as_str()).collect();
+        run_cmake_configure_and_build(&ext_dir, &b_dir, "qwen3_tts", &n_jobs, &extra_refs);
         let ggml_src = b_dir.join("ggml").join("src");
         (b_dir, ggml_src, None)
     };
@@ -424,7 +654,10 @@ fn main() {
     println!("cargo:rustc-link-lib=static=cpu_dispatch");
 
     if cpu_variants_dir.is_some() {
+        println!("cargo:rustc-link-lib=static=ggml-cpu-avx512-bf16");
+        println!("cargo:rustc-link-lib=static=ggml-cpu-avx512-vnni");
         println!("cargo:rustc-link-lib=static=ggml-cpu-avx512");
+        println!("cargo:rustc-link-lib=static=ggml-cpu-avx2-vnni");
         println!("cargo:rustc-link-lib=static=ggml-cpu-avx2");
         println!("cargo:rustc-link-lib=static=ggml-cpu-sse42");
         println!("cargo:rustc-link-lib=static=ggml-cpu-x64");
@@ -433,9 +666,13 @@ fn main() {
     }
     println!("cargo:rustc-link-lib=static=ggml-base");
 
-    // Link C++ runtime and system dependencies
-    println!("cargo:rustc-link-lib=dylib=stdc++");
-    println!("cargo:rustc-link-lib=dylib=gomp");
+    // Link C++ runtime and system dependencies (OpenMP/libgomp eliminated via native ggml_threadpool!)
+    if target_os == "macos" {
+        println!("cargo:rustc-link-lib=dylib=c++");
+        println!("cargo:rustc-link-lib=framework=Accelerate");
+    } else {
+        println!("cargo:rustc-link-lib=dylib=stdc++");
+    }
     println!("cargo:rustc-link-lib=dylib=m");
     println!("cargo:rustc-link-lib=dylib=pthread");
     println!("cargo:rustc-link-lib=dylib=dl");

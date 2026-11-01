@@ -156,7 +156,7 @@ struct CommonSynthArgs {
 
 #[derive(Parser)]
 #[command(name = "voicecli")]
-#[command(version = "0.3.1")]
+#[command(version = "0.4.0")]
 #[command(author = "Antigravity")]
 #[command(
     about = "High-Performance Native Qwen3-TTS CLI (Rust + C/C++ GGML)",
@@ -488,20 +488,14 @@ fn preprocess_text(input: &str, clean_markdown: bool) -> String {
 
 fn is_abbreviation(word: &str) -> bool {
     let clean = word.trim_matches(|c: char| {
-        c == '"'
-            || c == '\''
-            || c == '('
-            || c == ')'
-            || c == '['
-            || c == ']'
-            || c == '{'
-            || c == '}'
-            || c == '“'
-            || c == '”'
-            || c == '‘'
-            || c == '’'
+        matches!(
+            c,
+            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '“' | '”' | '‘' | '’'
+        )
     });
-    let lower = clean.to_lowercase();
+    if clean.is_empty() {
+        return false;
+    }
 
     const KNOWN_ABBREVS: &[&str] = &[
         "mr.", "mrs.", "ms.", "dr.", "prof.", "sr.", "jr.", "rev.", "gen.", "gov.",
@@ -513,18 +507,33 @@ fn is_abbreviation(word: &str) -> bool {
         "aug.", "sep.", "sept.", "oct.", "nov.", "dec.",
     ];
 
-    if KNOWN_ABBREVS.contains(&lower.as_str()) {
-        return true;
+    if clean.len() <= 8 && clean.is_ascii() {
+        let mut lower_buf = [0u8; 8];
+        for (dst, src) in lower_buf.iter_mut().zip(clean.bytes()) {
+            *dst = src.to_ascii_lowercase();
+        }
+        if let Ok(lower_str) = std::str::from_utf8(&lower_buf[..clean.len()]) {
+            if KNOWN_ABBREVS.contains(&lower_str) {
+                return true;
+            }
+        }
     }
 
     // Single-letter initials like "J." or "W."
-    let chars: Vec<char> = clean.chars().collect();
-    if chars.len() == 2 && chars[0].is_alphabetic() && chars[1] == '.' {
-        return true;
+    {
+        let mut it = clean.chars();
+        if let (Some(c0), Some('.'), None) = (it.next(), it.next(), it.next()) {
+            if c0.is_alphabetic() {
+                return true;
+            }
+        }
     }
 
     // Multi-period acronyms like "U.S.A."
-    if chars.len() >= 4 && chars.ends_with(&['.']) && chars.iter().filter(|&&c| c == '.').count() >= 2 {
+    if clean.ends_with('.')
+        && clean.bytes().filter(|&b| b == b'.').count() >= 2
+        && clean.chars().count() >= 4
+    {
         return true;
     }
 
@@ -533,17 +542,17 @@ fn is_abbreviation(word: &str) -> bool {
 
 fn extract_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut last = 0;
-    let mut i = 0;
+    let idx_chars: Vec<(usize, char)> = text.char_indices().collect();
+    let len = idx_chars.len();
+    let mut last_byte = 0usize;
+    let mut i = 0usize;
 
     while i < len {
-        let c = chars[i];
+        let (byte_i, c) = idx_chars[i];
         if c == '.' || c == '!' || c == '?' || c == '。' || c == '！' || c == '？' {
             // Ignore ellipsis (e.g. '...')
-            if c == '.' && i + 1 < len && chars[i + 1] == '.' {
-                while i + 1 < len && chars[i + 1] == '.' {
+            if c == '.' && i + 1 < len && idx_chars[i + 1].1 == '.' {
+                while i + 1 < len && idx_chars[i + 1].1 == '.' {
                     i += 1;
                 }
                 i += 1;
@@ -551,7 +560,12 @@ fn extract_sentences(text: &str) -> Vec<String> {
             }
 
             // Ignore decimal numbers (e.g. "3.14")
-            if c == '.' && i > 0 && i + 1 < len && chars[i - 1].is_ascii_digit() && chars[i + 1].is_ascii_digit() {
+            if c == '.'
+                && i > 0
+                && i + 1 < len
+                && idx_chars[i - 1].1.is_ascii_digit()
+                && idx_chars[i + 1].1.is_ascii_digit()
+            {
                 i += 1;
                 continue;
             }
@@ -559,16 +573,11 @@ fn extract_sentences(text: &str) -> Vec<String> {
             // Consume any trailing closing quotes or brackets
             let mut end_punct = i;
             while end_punct + 1 < len {
-                let next_c = chars[end_punct + 1];
-                if next_c == '"'
-                    || next_c == '\''
-                    || next_c == '”'
-                    || next_c == '’'
-                    || next_c == '»'
-                    || next_c == ')'
-                    || next_c == ']'
-                    || next_c == '}'
-                {
+                let next_c = idx_chars[end_punct + 1].1;
+                if matches!(
+                    next_c,
+                    '"' | '\'' | '”' | '’' | '»' | ')' | ']' | '}'
+                ) {
                     end_punct += 1;
                 } else {
                     break;
@@ -577,26 +586,31 @@ fn extract_sentences(text: &str) -> Vec<String> {
 
             // Check if boundary is followed by whitespace or end of string (or CJK punctuation)
             let is_cjk_punct = c == '。' || c == '！' || c == '？';
-            if is_cjk_punct || end_punct + 1 == len || chars[end_punct + 1].is_whitespace() {
+            if is_cjk_punct || end_punct + 1 == len || idx_chars[end_punct + 1].1.is_whitespace() {
                 // If followed by lowercase letters (e.g. dialogue tag: `"Hello!" she said.`), do not split
                 let mut is_dialogue_continuation = false;
                 let mut next_idx = end_punct + 1;
-                while next_idx < len && chars[next_idx].is_whitespace() {
+                while next_idx < len && idx_chars[next_idx].1.is_whitespace() {
                     next_idx += 1;
                 }
-                if next_idx < len && chars[next_idx].is_lowercase() {
+                if next_idx < len && idx_chars[next_idx].1.is_lowercase() {
                     is_dialogue_continuation = true;
                 }
 
-                let preceding: String = chars[last..=i].iter().collect();
+                let punct_end_byte = byte_i + c.len_utf8();
+                let preceding = &text[last_byte..punct_end_byte];
                 let last_word = preceding.split_whitespace().last().unwrap_or("");
                 if !is_dialogue_continuation && !is_abbreviation(last_word) {
-                    let sentence_str: String = chars[last..=end_punct].iter().collect();
-                    let trimmed = sentence_str.trim().to_string();
+                    let slice_end = if end_punct + 1 < len {
+                        idx_chars[end_punct + 1].0
+                    } else {
+                        text.len()
+                    };
+                    let trimmed = text[last_byte..slice_end].trim();
                     if !trimmed.is_empty() {
-                        sentences.push(trimmed);
+                        sentences.push(trimmed.to_string());
                     }
-                    last = end_punct + 1;
+                    last_byte = slice_end;
                     i = end_punct;
                 }
             }
@@ -604,24 +618,32 @@ fn extract_sentences(text: &str) -> Vec<String> {
         i += 1;
     }
 
-    if last < len {
-        let remaining: String = chars[last..].iter().collect();
-        let trimmed = remaining.trim().to_string();
+    if last_byte < text.len() {
+        let trimmed = text[last_byte..].trim();
         if !trimmed.is_empty() {
-            sentences.push(trimmed);
+            sentences.push(trimmed.to_string());
         }
     }
 
     sentences
 }
 
+fn byte_index_at_char(s: &str, char_limit: usize) -> (usize, usize) {
+    for (count, (byte_idx, _)) in s.char_indices().enumerate() {
+        if count == char_limit {
+            return (byte_idx, count);
+        }
+    }
+    (s.len(), s.chars().count())
+}
+
 fn split_long_sentence(sentence: &str, target_chars: usize) -> Vec<String> {
-    if sentence.chars().count() <= target_chars {
+    let mut remaining = sentence.trim();
+    if remaining.chars().count() <= target_chars {
         return vec![sentence.to_string()];
     }
 
     let mut parts = Vec::new();
-    let mut remaining = sentence.trim().to_string();
 
     const CLAUSE_DELIMS: &[&str] = &[
         "; ",
@@ -645,49 +667,51 @@ fn split_long_sentence(sentence: &str, target_chars: usize) -> Vec<String> {
         "，",
     ];
 
-    while remaining.chars().count() > target_chars {
-        let count = remaining.chars().count();
-        let search_limit = std::cmp::min(count, target_chars + 50);
-        let window: String = remaining.chars().take(search_limit).collect();
+    loop {
+        let (window_end_byte, window_chars) = byte_index_at_char(remaining, target_chars + 50);
+        if window_chars <= target_chars && window_end_byte == remaining.len() {
+            let (exact_end_byte, exact_chars) = byte_index_at_char(remaining, target_chars + 1);
+            if exact_chars <= target_chars && exact_end_byte == remaining.len() {
+                break;
+            }
+        }
+        if remaining.chars().count() <= target_chars {
+            break;
+        }
 
-        let mut best_break = None;
+        let window = &remaining[..window_end_byte];
+        let mut best_break_byte = None;
 
         for &delim in CLAUSE_DELIMS {
             if let Some(pos) = window.rfind(delim) {
                 let char_pos = window[..pos].chars().count();
                 if char_pos >= target_chars / 3 {
-                    let delim_char_len = delim.trim_end().chars().count();
-                    best_break = Some(char_pos + delim_char_len);
+                    let trimmed_delim = delim.trim_end();
+                    best_break_byte = Some(pos + trimmed_delim.len());
                     break;
                 }
             }
         }
 
-        if best_break.is_none() {
+        if best_break_byte.is_none() {
             if let Some(pos) = window.rfind(' ') {
                 let char_pos = window[..pos].chars().count();
                 if char_pos >= target_chars / 3 {
-                    best_break = Some(char_pos);
+                    best_break_byte = Some(pos);
                 }
             }
         }
 
-        let break_point = best_break.unwrap_or(target_chars);
-        let chunk: String = remaining.chars().take(break_point).collect();
-        let chunk_trimmed = chunk.trim().to_string();
+        let break_byte = best_break_byte.unwrap_or_else(|| byte_index_at_char(remaining, target_chars).0);
+        let chunk_trimmed = remaining[..break_byte].trim();
         if !chunk_trimmed.is_empty() {
-            parts.push(chunk_trimmed);
+            parts.push(chunk_trimmed.to_string());
         }
-        remaining = remaining
-            .chars()
-            .skip(break_point)
-            .collect::<String>()
-            .trim()
-            .to_string();
+        remaining = remaining[break_byte..].trim();
     }
 
     if !remaining.is_empty() {
-        parts.push(remaining);
+        parts.push(remaining.to_string());
     }
 
     parts

@@ -6,16 +6,22 @@
 
 #if defined(VOICECLI_MULTI_ISA) && (defined(__x86_64__) || defined(_M_X64))
 
+extern ggml_backend_reg_t voicecli_avx512_bf16_ggml_backend_cpu_reg(void);
+extern ggml_backend_reg_t voicecli_avx512_vnni_ggml_backend_cpu_reg(void);
 extern ggml_backend_reg_t voicecli_avx512_ggml_backend_cpu_reg(void);
+extern ggml_backend_reg_t voicecli_avx2_vnni_ggml_backend_cpu_reg(void);
 extern ggml_backend_reg_t voicecli_avx2_ggml_backend_cpu_reg(void);
 extern ggml_backend_reg_t voicecli_sse42_ggml_backend_cpu_reg(void);
 extern ggml_backend_reg_t voicecli_x64_ggml_backend_cpu_reg(void);
 
 typedef enum {
-    VOICECLI_ISA_X64    = 0,
-    VOICECLI_ISA_SSE42  = 1,
-    VOICECLI_ISA_AVX2   = 2,
-    VOICECLI_ISA_AVX512 = 3,
+    VOICECLI_ISA_X64         = 0,
+    VOICECLI_ISA_SSE42       = 1,
+    VOICECLI_ISA_AVX2        = 2,
+    VOICECLI_ISA_AVX2_VNNI   = 3,
+    VOICECLI_ISA_AVX512      = 4,
+    VOICECLI_ISA_AVX512_VNNI = 5,
+    VOICECLI_ISA_AVX512_BF16 = 6,
 } voicecli_isa_tier_t;
 
 static void cpuid_x86(uint32_t leaf, uint32_t subleaf, uint32_t out[4]) {
@@ -61,13 +67,11 @@ static voicecli_isa_tier_t detect_best_isa_tier(void) {
         return cached_tier;
     }
 
+    int can_tier[7] = {1, 0, 0, 0, 0, 0, 0};
+
     uint32_t regs[4] = {0, 0, 0, 0};
     cpuid_x86(0, 0, regs);
     uint32_t max_leaf = regs[0];
-
-    int can_sse42 = 0;
-    int can_avx2 = 0;
-    int can_avx512 = 0;
 
     if (max_leaf >= 1) {
         cpuid_x86(1, 0, regs);
@@ -84,7 +88,8 @@ static voicecli_isa_tier_t detect_best_isa_tier(void) {
         int avx     = (ecx >> 28) & 1;
         int f16c    = (ecx >> 29) & 1;
 
-        can_sse42 = sse3 && ssse3 && sse41 && sse42 && popcnt;
+        int can_sse42 = sse3 && ssse3 && sse41 && sse42 && popcnt;
+        can_tier[VOICECLI_ISA_SSE42] = can_sse42;
 
         int os_avx = 0;
         int os_avx512 = 0;
@@ -96,50 +101,73 @@ static voicecli_isa_tier_t detect_best_isa_tier(void) {
 
         if (max_leaf >= 7 && can_sse42 && os_avx && avx && f16c && fma) {
             cpuid_x86(7, 0, regs);
+            uint32_t max_subleaf_7 = regs[0];
             uint32_t ebx = regs[1];
+            uint32_t ecx7 = regs[2];
 
-            int bmi1     = (ebx >> 3)  & 1;
-            int avx2     = (ebx >> 5)  & 1;
-            int bmi2     = (ebx >> 8)  & 1;
-            int avx512f  = (ebx >> 16) & 1;
-            int avx512dq = (ebx >> 17) & 1;
-            int avx512cd = (ebx >> 28) & 1;
-            int avx512bw = (ebx >> 30) & 1;
-            int avx512vl = (ebx >> 31) & 1;
+            int bmi1        = (ebx >> 3)  & 1;
+            int avx2        = (ebx >> 5)  & 1;
+            int bmi2        = (ebx >> 8)  & 1;
+            int avx512f     = (ebx >> 16) & 1;
+            int avx512dq    = (ebx >> 17) & 1;
+            int avx512cd    = (ebx >> 28) & 1;
+            int avx512bw    = (ebx >> 30) & 1;
+            int avx512vl    = (ebx >> 31) & 1;
+            int avx512_vbmi = (ecx7 >> 1)  & 1;
+            int avx512_vnni = (ecx7 >> 11) & 1;
 
-            can_avx2 = bmi1 && bmi2 && avx2;
-            can_avx512 = can_avx2 && os_avx512 &&
-                         avx512f && avx512dq && avx512cd && avx512bw && avx512vl;
+            int avx_vnni    = 0;
+            int avx512_bf16 = 0;
+            if (max_subleaf_7 >= 1) {
+                uint32_t regs7_1[4] = {0, 0, 0, 0};
+                cpuid_x86(7, 1, regs7_1);
+                uint32_t eax7_1 = regs7_1[0];
+                avx_vnni    = (eax7_1 >> 4) & 1;
+                avx512_bf16 = (eax7_1 >> 5) & 1;
+            }
+
+            int can_avx2 = bmi1 && bmi2 && avx2;
+            int can_avx512 = can_avx2 && os_avx512 &&
+                             avx512f && avx512dq && avx512cd && avx512bw && avx512vl;
+
+            can_tier[VOICECLI_ISA_AVX2]        = can_avx2;
+            can_tier[VOICECLI_ISA_AVX2_VNNI]   = can_avx2 && avx_vnni;
+            can_tier[VOICECLI_ISA_AVX512]      = can_avx512;
+            can_tier[VOICECLI_ISA_AVX512_VNNI] = can_avx512 && avx512_vbmi && avx512_vnni;
+            can_tier[VOICECLI_ISA_AVX512_BF16] = can_avx512 && avx512_vbmi && avx512_vnni && avx512_bf16;
         }
     }
 
-    voicecli_isa_tier_t hw_best = VOICECLI_ISA_X64;
-    if (can_avx512) {
-        hw_best = VOICECLI_ISA_AVX512;
-    } else if (can_avx2) {
-        hw_best = VOICECLI_ISA_AVX2;
-    } else if (can_sse42) {
-        hw_best = VOICECLI_ISA_SSE42;
-    }
-
-    voicecli_isa_tier_t selected = hw_best;
+    voicecli_isa_tier_t max_tier = VOICECLI_ISA_AVX512_BF16;
     const char *env_simd = getenv("VOICECLI_SIMD");
     if (env_simd && env_simd[0] != '\0' && !str_eq_nocase(env_simd, "auto")) {
-        voicecli_isa_tier_t req = hw_best;
         if (str_eq_nocase(env_simd, "x64") ||
             str_eq_nocase(env_simd, "sse2") ||
             str_eq_nocase(env_simd, "generic") ||
             str_eq_nocase(env_simd, "baseline")) {
-            req = VOICECLI_ISA_X64;
+            max_tier = VOICECLI_ISA_X64;
         } else if (str_eq_nocase(env_simd, "sse42") || str_eq_nocase(env_simd, "sse4.2")) {
-            req = VOICECLI_ISA_SSE42;
+            max_tier = VOICECLI_ISA_SSE42;
         } else if (str_eq_nocase(env_simd, "avx2")) {
-            req = VOICECLI_ISA_AVX2;
+            max_tier = VOICECLI_ISA_AVX2;
+        } else if (str_eq_nocase(env_simd, "avx2_vnni") || str_eq_nocase(env_simd, "avx-vnni") || str_eq_nocase(env_simd, "avxvnni")) {
+            max_tier = VOICECLI_ISA_AVX2_VNNI;
         } else if (str_eq_nocase(env_simd, "avx512") || str_eq_nocase(env_simd, "avx-512")) {
-            req = VOICECLI_ISA_AVX512;
+            max_tier = VOICECLI_ISA_AVX512;
+        } else if (str_eq_nocase(env_simd, "avx512_vnni") || str_eq_nocase(env_simd, "avx512-vnni")) {
+            max_tier = VOICECLI_ISA_AVX512_VNNI;
+        } else if (str_eq_nocase(env_simd, "avx512_bf16") || str_eq_nocase(env_simd, "avx512-bf16")) {
+            max_tier = VOICECLI_ISA_AVX512_BF16;
         }
-        /* Clamp requested tier to what the host CPU + OS actually support */
-        selected = (req <= hw_best) ? req : hw_best;
+    }
+
+    /* Select highest supported tier <= max_tier */
+    voicecli_isa_tier_t selected = VOICECLI_ISA_X64;
+    for (int t = (int)max_tier; t >= 0; --t) {
+        if (can_tier[t]) {
+            selected = (voicecli_isa_tier_t)t;
+            break;
+        }
     }
 
     cached_tier = selected;
@@ -147,10 +175,20 @@ static voicecli_isa_tier_t detect_best_isa_tier(void) {
     return cached_tier;
 }
 
+int voicecli_get_active_simd_tier(void) {
+    return (int)detect_best_isa_tier();
+}
+
 const char *voicecli_get_active_simd_name(void) {
     switch (detect_best_isa_tier()) {
+        case VOICECLI_ISA_AVX512_BF16:
+            return "AVX-512 BF16 + VNNI + VBMI";
+        case VOICECLI_ISA_AVX512_VNNI:
+            return "AVX-512 VNNI + VBMI";
         case VOICECLI_ISA_AVX512:
             return "AVX-512 (x86-64-v4)";
+        case VOICECLI_ISA_AVX2_VNNI:
+            return "AVX2 + AVX-VNNI + FMA";
         case VOICECLI_ISA_AVX2:
             return "AVX2 + FMA + F16C (x86-64-v3)";
         case VOICECLI_ISA_SSE42:
@@ -163,8 +201,14 @@ const char *voicecli_get_active_simd_name(void) {
 
 ggml_backend_reg_t ggml_backend_cpu_reg(void) {
     switch (detect_best_isa_tier()) {
+        case VOICECLI_ISA_AVX512_BF16:
+            return voicecli_avx512_bf16_ggml_backend_cpu_reg();
+        case VOICECLI_ISA_AVX512_VNNI:
+            return voicecli_avx512_vnni_ggml_backend_cpu_reg();
         case VOICECLI_ISA_AVX512:
             return voicecli_avx512_ggml_backend_cpu_reg();
+        case VOICECLI_ISA_AVX2_VNNI:
+            return voicecli_avx2_vnni_ggml_backend_cpu_reg();
         case VOICECLI_ISA_AVX2:
             return voicecli_avx2_ggml_backend_cpu_reg();
         case VOICECLI_ISA_SSE42:
@@ -176,6 +220,10 @@ ggml_backend_reg_t ggml_backend_cpu_reg(void) {
 }
 
 #else
+
+int voicecli_get_active_simd_tier(void) {
+    return 0;
+}
 
 const char *voicecli_get_active_simd_name(void) {
 #if defined(__aarch64__) || defined(_M_ARM64)

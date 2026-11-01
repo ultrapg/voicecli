@@ -1,0 +1,456 @@
+#include "tts_transformer.h"
+#include "transformer/transformer_state_internal.h"
+#include "transformer/transformer_internal.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
+
+namespace qwen3_tts {
+
+namespace {
+
+bool packed_talker_qkv_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("QWEN3_TTS_TALKER_PACKED_QKV");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+
+bool packed_talker_ffn_enabled() {
+    static const bool enabled = []() {
+        const char * value = std::getenv("QWEN3_TTS_TALKER_PACKED_FFN");
+        return !(value && value[0] == '0');
+    }();
+    return enabled;
+}
+
+bool is_cuda_backend(ggml_backend_t backend) {
+    ggml_backend_dev_t device = backend ? ggml_backend_get_device(backend) : nullptr;
+    const char * name = device ? ggml_backend_dev_name(device) : nullptr;
+    return name && std::strstr(name, "CUDA") != nullptr;
+}
+
+struct ggml_tensor * ffn_down_matmul(struct ggml_context * ctx,
+                                     struct ggml_tensor * weight,
+                                     struct ggml_tensor * input) {
+    if (weight->type == GGML_TYPE_F16) {
+        weight = ggml_cast(ctx, weight, GGML_TYPE_F32);
+    }
+    return ggml_mul_mat(ctx, weight, input);
+}
+
+} // namespace
+
+struct ggml_cgraph * transformer_internal::ops::build_prefill_forward_graph(TTSTransformer & self, int32_t n_tokens, int32_t n_past) {
+    auto & impl = self.impl_;
+    const auto & cfg = impl->model.config;
+    const int n_head = cfg.n_attention_heads;
+    const int n_kv_head = cfg.n_key_value_heads;
+    const int head_dim = cfg.head_dim;
+    const int hidden_size = cfg.hidden_size;
+    const float eps = cfg.rms_norm_eps;
+    const float rope_theta = cfg.rope_theta;
+    const int n_layer = cfg.n_layers;
+    const bool cuda_backend = is_cuda_backend(impl->state.backend);
+    const int n_kv_view = cuda_backend
+        ? std::min<int>(impl->state.cache.n_ctx, GGML_PAD(n_past + n_tokens, 256))
+        : (n_past + n_tokens);
+    const bool need_mask = cuda_backend || n_tokens > 1;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ impl->state.compute_meta.size(),
+        /*.mem_buffer =*/ impl->state.compute_meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+
+    struct ggml_tensor * inp_prefill_embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, n_tokens);
+    ggml_set_name(inp_prefill_embd, "inp_prefill_embd");
+    ggml_set_input(inp_prefill_embd);
+
+    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
+    ggml_set_name(inp_pos, "inp_pos");
+    ggml_set_input(inp_pos);
+
+    struct ggml_tensor * inp_mrope_pos = nullptr;
+    if (cfg.use_mrope) {
+        inp_mrope_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4 * n_tokens);
+        ggml_set_name(inp_mrope_pos, "inp_mrope_pos");
+        ggml_set_input(inp_mrope_pos);
+    }
+
+    struct ggml_tensor * inp_mask = nullptr;
+    if (need_mask) {
+        inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv_view, n_tokens);
+        ggml_set_name(inp_mask, "inp_mask");
+        ggml_set_input(inp_mask);
+    }
+
+    struct ggml_tensor * cur = inp_prefill_embd;
+    struct ggml_tensor * inpL = cur;
+
+    int mrope_sections[GGML_MROPE_SECTIONS] = { cfg.mrope_section[0], cfg.mrope_section[1], cfg.mrope_section[2], 0 };
+
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = impl->model.layers[il];
+
+        cur = ggml_rms_norm(ctx0, inpL, eps);
+        cur = ggml_mul(ctx0, cur, layer.attn_norm);
+
+        struct ggml_tensor * Qcur = nullptr;
+        struct ggml_tensor * Kcur = nullptr;
+        struct ggml_tensor * Vcur = nullptr;
+        if (packed_talker_qkv_enabled() && !cuda_backend && layer.attn_qkv) {
+            struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
+            const size_t q_bytes = (size_t) head_dim * (size_t) n_head * qkv->nb[0];
+            const size_t kv_bytes = (size_t) head_dim * (size_t) n_kv_head * qkv->nb[0];
+            Qcur = ggml_view_3d(ctx0, qkv, head_dim, n_head, n_tokens,
+                                (size_t) head_dim * qkv->nb[0], qkv->nb[1], 0);
+            Kcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens,
+                                (size_t) head_dim * qkv->nb[0], qkv->nb[1], q_bytes);
+            Vcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens,
+                                (size_t) head_dim * qkv->nb[0], qkv->nb[1], q_bytes + kv_bytes);
+        } else {
+            Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+            Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+            Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        }
+
+        if (layer.attn_q_norm) {
+            Qcur = ggml_rms_norm(ctx0, Qcur, eps);
+            Qcur = ggml_mul(ctx0, Qcur, layer.attn_q_norm);
+        }
+
+        if (layer.attn_k_norm) {
+            Kcur = ggml_rms_norm(ctx0, Kcur, eps);
+            Kcur = ggml_mul(ctx0, Kcur, layer.attn_k_norm);
+        }
+
+        if (cfg.use_mrope) {
+            Qcur = ggml_rope_multi(ctx0, Qcur, inp_mrope_pos, nullptr,
+                                   head_dim, mrope_sections, GGML_ROPE_TYPE_MROPE, 0,
+                                   rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            Kcur = ggml_rope_multi(ctx0, Kcur, inp_mrope_pos, nullptr,
+                                   head_dim, mrope_sections, GGML_ROPE_TYPE_MROPE, 0,
+                                   rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        } else {
+            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
+                                 head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
+                                 head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
+
+        struct ggml_tensor * k_cache = impl->state.cache.k_cache[il];
+        struct ggml_tensor * v_cache = impl->state.cache.v_cache[il];
+
+        struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, impl->state.cache.n_ctx, k_cache->nb[2], 0);
+        struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, impl->state.cache.n_ctx, v_cache->nb[2], 0);
+
+        struct ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, n_tokens, Kcur->nb[2], 0);
+        struct ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, n_tokens, Vcur->nb[2], 0);
+
+        struct ggml_tensor * k_updated = ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, inp_pos);
+        struct ggml_tensor * v_updated = ggml_set_rows(ctx0, v_cache_2d, Vcur_2d, inp_pos);
+
+        ggml_build_forward_expand(gf, k_updated);
+        ggml_build_forward_expand(gf, v_updated);
+
+        struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
+            head_dim, n_kv_head, n_kv_view,
+            k_cache->nb[1], k_cache->nb[2], 0);
+
+        struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
+            head_dim, n_kv_head, n_kv_view,
+            v_cache->nb[1], v_cache->nb[2], 0);
+
+        struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
+
+        struct ggml_tensor * KQV_fa = ggml_flash_attn_ext(ctx0, Q, K, V, inp_mask,
+                                                          1.0f / sqrtf((float) head_dim), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_prec(KQV_fa, GGML_PREC_F32);
+        cur = ggml_cont_2d(ctx0, KQV_fa, n_head * head_dim, n_tokens);
+
+        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = ggml_add(ctx0, cur, inpL);
+        struct ggml_tensor * inpFF = cur;
+
+        cur = ggml_rms_norm(ctx0, inpFF, eps);
+        cur = ggml_mul(ctx0, cur, layer.ffn_norm);
+
+        if (packed_talker_ffn_enabled() && !cuda_backend && layer.ffn_gate_up) {
+            struct ggml_tensor * gate_up = ggml_mul_mat(ctx0, layer.ffn_gate_up, cur);
+            cur = ggml_swiglu(ctx0, gate_up);
+        } else {
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+            cur = ggml_swiglu_split(ctx0, gate, up);
+        }
+
+        cur = ffn_down_matmul(ctx0, layer.ffn_down, cur);
+
+        inpL = ggml_add(ctx0, cur, inpFF);
+    }
+
+    cur = inpL;
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, impl->model.output_norm);
+    ggml_set_name(cur, "hidden_states");
+    ggml_set_output(cur);
+
+    // Only the final prefill token's logits are ever consumed; project [hidden_size, 1] instead of all n_tokens
+    struct ggml_tensor * last_cur = ggml_view_2d(
+        ctx0, cur, hidden_size, 1, cur->nb[1],
+        (size_t) (n_tokens - 1) * cur->nb[1]);
+    struct ggml_tensor * logits = ggml_mul_mat(ctx0, impl->model.codec_head, last_cur);
+    ggml_set_name(logits, "logits");
+    ggml_set_output(logits);
+
+    ggml_build_forward_expand(gf, logits);
+    if (impl->state.hidden_bridge) {
+        struct ggml_tensor * last_hidden = ggml_view_1d(
+            ctx0, cur, hidden_size,
+            (size_t) (n_tokens - 1) * (size_t) hidden_size * sizeof(float));
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_hidden, impl->state.hidden_bridge));
+    }
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+struct ggml_cgraph * transformer_internal::ops::build_step_graph(TTSTransformer & self, int32_t n_past,
+                                                                 bool use_frame_codes,
+                                                                 std::vector<uint8_t> * meta_override) {
+    auto & impl = self.impl_;
+    const auto & cfg = impl->model.config;
+    const int n_head = cfg.n_attention_heads;
+    const int n_kv_head = cfg.n_key_value_heads;
+    const int head_dim = cfg.head_dim;
+    const int hidden_size = cfg.hidden_size;
+    const float eps = cfg.rms_norm_eps;
+    const float rope_theta = cfg.rope_theta;
+    const int n_layer = cfg.n_layers;
+    const int n_tokens = 1;
+    const bool cuda_backend = is_cuda_backend(impl->state.backend);
+    // On CPU, view the exact [0 .. n_past] KV range without 256-padding or mask uploads
+    const int n_kv_view = cuda_backend
+        ? std::min<int>(impl->state.cache.n_ctx, GGML_PAD(n_past + n_tokens, 256))
+        : (n_past + n_tokens);
+
+    std::vector<uint8_t> & meta = meta_override ? *meta_override : impl->state.compute_meta;
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ meta.size(),
+        /*.mem_buffer =*/ meta.data(),
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx0 = ggml_init(params);
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx0, QWEN3_TTS_MAX_NODES, false);
+
+    struct ggml_tensor * cur = nullptr;
+    if (use_frame_codes) {
+        struct ggml_tensor * inp_frame_codes = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, cfg.n_codebooks);
+        ggml_set_name(inp_frame_codes, "inp_frame_codes");
+        ggml_set_input(inp_frame_codes);
+
+        struct ggml_tensor * inp_overlay = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
+        ggml_set_name(inp_overlay, "inp_overlay_embd");
+        ggml_set_input(inp_overlay);
+
+        struct ggml_tensor * code_idx = ggml_view_1d(ctx0, inp_frame_codes, 1, 0);
+        cur = ggml_get_rows(ctx0, impl->model.codec_embd, code_idx);
+        cur = ggml_reshape_2d(ctx0, cur, hidden_size, 1);
+
+        for (int cb = 1; cb < cfg.n_codebooks; ++cb) {
+            code_idx = ggml_view_1d(ctx0, inp_frame_codes, 1, (size_t) cb * sizeof(int32_t));
+            struct ggml_tensor * code_embd = ggml_get_rows(ctx0, impl->model.code_pred_embd[cb - 1], code_idx);
+            code_embd = ggml_reshape_2d(ctx0, code_embd, hidden_size, 1);
+            cur = ggml_add(ctx0, cur, code_embd);
+        }
+        cur = ggml_add(ctx0, cur, inp_overlay);
+    } else {
+        cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hidden_size, 1);
+        ggml_set_name(cur, "inp_step_embd");
+        ggml_set_input(cur);
+    }
+
+    struct ggml_tensor * inp_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 1);
+    ggml_set_name(inp_pos, "inp_pos");
+    ggml_set_input(inp_pos);
+
+    struct ggml_tensor * inp_mrope_pos = nullptr;
+    if (cfg.use_mrope) {
+        inp_mrope_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4);
+        ggml_set_name(inp_mrope_pos, "inp_mrope_pos");
+        ggml_set_input(inp_mrope_pos);
+    }
+
+    struct ggml_tensor * inp_mask = nullptr;
+    if (cuda_backend) {
+        inp_mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_kv_view, 1);
+        ggml_set_name(inp_mask, "inp_mask");
+        ggml_set_input(inp_mask);
+    }
+
+    struct ggml_tensor * inpL = cur;
+
+    const float KQscale = 1.0f / sqrtf((float) head_dim);
+    int mrope_sections[GGML_MROPE_SECTIONS] = { cfg.mrope_section[0], cfg.mrope_section[1], cfg.mrope_section[2], 0 };
+
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = impl->model.layers[il];
+
+        cur = ggml_rms_norm(ctx0, inpL, eps);
+        cur = ggml_mul(ctx0, cur, layer.attn_norm);
+
+        struct ggml_tensor * Qcur = nullptr;
+        struct ggml_tensor * Kcur = nullptr;
+        struct ggml_tensor * Vcur = nullptr;
+        if (packed_talker_qkv_enabled() && layer.attn_qkv) {
+            struct ggml_tensor * qkv = ggml_mul_mat(ctx0, layer.attn_qkv, cur);
+            const size_t q_bytes = (size_t) head_dim * (size_t) n_head * qkv->nb[0];
+            const size_t kv_bytes = (size_t) head_dim * (size_t) n_kv_head * qkv->nb[0];
+            Qcur = ggml_view_3d(ctx0, qkv, head_dim, n_head, n_tokens,
+                                (size_t) head_dim * qkv->nb[0], qkv->nb[1], 0);
+            Kcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens,
+                                (size_t) head_dim * qkv->nb[0], qkv->nb[1], q_bytes);
+            Vcur = ggml_view_3d(ctx0, qkv, head_dim, n_kv_head, n_tokens,
+                                (size_t) head_dim * qkv->nb[0], qkv->nb[1], q_bytes + kv_bytes);
+        } else {
+            Qcur = ggml_mul_mat(ctx0, layer.attn_q, cur);
+            Kcur = ggml_mul_mat(ctx0, layer.attn_k, cur);
+            Vcur = ggml_mul_mat(ctx0, layer.attn_v, cur);
+
+            Qcur = ggml_reshape_3d(ctx0, Qcur, head_dim, n_head, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, head_dim, n_kv_head, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, head_dim, n_kv_head, n_tokens);
+        }
+
+        if (layer.attn_q_norm) {
+            Qcur = ggml_rms_norm(ctx0, Qcur, eps);
+            Qcur = ggml_mul(ctx0, Qcur, layer.attn_q_norm);
+        }
+
+        if (layer.attn_k_norm) {
+            Kcur = ggml_rms_norm(ctx0, Kcur, eps);
+            Kcur = ggml_mul(ctx0, Kcur, layer.attn_k_norm);
+        }
+
+        if (cfg.use_mrope) {
+            Qcur = ggml_rope_multi(ctx0, Qcur, inp_mrope_pos, nullptr,
+                                   head_dim, mrope_sections, GGML_ROPE_TYPE_MROPE, 0,
+                                   rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            Kcur = ggml_rope_multi(ctx0, Kcur, inp_mrope_pos, nullptr,
+                                   head_dim, mrope_sections, GGML_ROPE_TYPE_MROPE, 0,
+                                   rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        } else {
+            Qcur = ggml_rope_ext(ctx0, Qcur, inp_pos, nullptr,
+                                 head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            Kcur = ggml_rope_ext(ctx0, Kcur, inp_pos, nullptr,
+                                 head_dim, GGML_ROPE_TYPE_NEOX, 0,
+                                 rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
+
+        struct ggml_tensor * k_cache = impl->state.cache.k_cache[il];
+        struct ggml_tensor * v_cache = impl->state.cache.v_cache[il];
+
+        struct ggml_tensor * k_cache_2d = ggml_view_2d(ctx0, k_cache, head_dim * n_kv_head, impl->state.cache.n_ctx, k_cache->nb[2], 0);
+        struct ggml_tensor * v_cache_2d = ggml_view_2d(ctx0, v_cache, head_dim * n_kv_head, impl->state.cache.n_ctx, v_cache->nb[2], 0);
+
+        struct ggml_tensor * Kcur_2d = ggml_view_2d(ctx0, Kcur, head_dim * n_kv_head, n_tokens, Kcur->nb[2], 0);
+        struct ggml_tensor * Vcur_2d = ggml_view_2d(ctx0, Vcur, head_dim * n_kv_head, n_tokens, Vcur->nb[2], 0);
+
+        struct ggml_tensor * k_updated = ggml_set_rows(ctx0, k_cache_2d, Kcur_2d, inp_pos);
+        struct ggml_tensor * v_updated = ggml_set_rows(ctx0, v_cache_2d, Vcur_2d, inp_pos);
+
+        ggml_build_forward_expand(gf, k_updated);
+        ggml_build_forward_expand(gf, v_updated);
+
+        struct ggml_tensor * K = ggml_view_3d(ctx0, k_cache,
+            head_dim, n_kv_head, n_kv_view,
+            k_cache->nb[1], k_cache->nb[2], 0);
+
+        struct ggml_tensor * V = ggml_view_3d(ctx0, v_cache,
+            head_dim, n_kv_head, n_kv_view,
+            v_cache->nb[1], v_cache->nb[2], 0);
+
+        struct ggml_tensor * Q = ggml_permute(ctx0, Qcur, 0, 2, 1, 3);
+        K = ggml_permute(ctx0, K, 0, 2, 1, 3);
+        V = ggml_permute(ctx0, V, 0, 2, 1, 3);
+
+        if (n_tokens == 1) {
+            struct ggml_tensor * KQV_fa = ggml_flash_attn_ext(ctx0, Q, K, V, inp_mask,
+                                                              KQscale, 0.0f, 0.0f);
+            cur = ggml_cont_2d(ctx0, KQV_fa, n_head * head_dim, n_tokens);
+        } else {
+            struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+            KQ = ggml_scale(ctx0, KQ, KQscale);
+            KQ = ggml_diag_mask_inf(ctx0, KQ, n_past);
+            KQ = ggml_soft_max(ctx0, KQ);
+
+            V = ggml_cont(ctx0, ggml_transpose(ctx0, V));
+
+            struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ);
+            KQV = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+            cur = ggml_cont_2d(ctx0, KQV, n_head * head_dim, n_tokens);
+        }
+
+        cur = ggml_mul_mat(ctx0, layer.attn_output, cur);
+        cur = ggml_add(ctx0, cur, inpL);
+        struct ggml_tensor * inpFF = cur;
+
+        cur = ggml_rms_norm(ctx0, inpFF, eps);
+        cur = ggml_mul(ctx0, cur, layer.ffn_norm);
+
+        if (packed_talker_ffn_enabled() && !cuda_backend && layer.ffn_gate_up) {
+            struct ggml_tensor * gate_up = ggml_mul_mat(ctx0, layer.ffn_gate_up, cur);
+            cur = ggml_swiglu(ctx0, gate_up);
+        } else {
+            struct ggml_tensor * gate = ggml_mul_mat(ctx0, layer.ffn_gate, cur);
+            struct ggml_tensor * up = ggml_mul_mat(ctx0, layer.ffn_up, cur);
+            cur = ggml_swiglu_split(ctx0, gate, up);
+        }
+
+        cur = ffn_down_matmul(ctx0, layer.ffn_down, cur);
+
+        inpL = ggml_add(ctx0, cur, inpFF);
+    }
+
+    cur = inpL;
+    cur = ggml_rms_norm(ctx0, cur, eps);
+    cur = ggml_mul(ctx0, cur, impl->model.output_norm);
+    ggml_set_name(cur, "hidden_states");
+    ggml_set_output(cur);
+
+    struct ggml_tensor * logits = ggml_mul_mat(ctx0, impl->model.codec_head, cur);
+    ggml_set_name(logits, "logits");
+    ggml_set_output(logits);
+
+    ggml_build_forward_expand(gf, logits);
+    if (impl->state.hidden_bridge) {
+        struct ggml_tensor * last_hidden = ggml_view_1d(ctx0, cur, hidden_size, 0);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_hidden, impl->state.hidden_bridge));
+    }
+
+    ggml_free(ctx0);
+    return gf;
+}
+
+} // namespace qwen3_tts

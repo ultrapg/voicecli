@@ -7,18 +7,30 @@
 #include <stdbool.h>
 #include <math.h>
 #include <errno.h>
+#include <time.h>
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 #include "qwen3_tts_c.h"
 
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+#endif
+
 extern const char* voicecli_get_active_simd_name(void);
+extern int voicecli_get_active_simd_tier(void);
 
 #ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
 #include <io.h>
 #include <fcntl.h>
+#include <process.h>
 #define isatty _isatty
 #define fileno _fileno
+#define getpid _getpid
 #define PATH_SEP '\\'
 #else
 #include <unistd.h>
@@ -45,53 +57,365 @@ typedef struct {
     const char* save_profile;
 } voicecli_options_t;
 
+// Fast monotonic nanosecond clock (userspace vDSO on Linux, zero kernel syscalls)
+static int64_t monotonic_now_ns(void) {
+#ifdef _WIN32
+    static LARGE_INTEGER freq = {0};
+    if (freq.QuadPart == 0) {
+        QueryPerformanceFrequency(&freq);
+    }
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    return (int64_t)((double)counter.QuadPart * 1e9 / (double)freq.QuadPart);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+#endif
+}
+
+static bool is_ascii_vowel(unsigned char c) {
+    unsigned char lc = (unsigned char)(c | 0x20);
+    return lc == 'a' || lc == 'e' || lc == 'i' || lc == 'o' || lc == 'u' || lc == 'y';
+}
+
+// Fast O(N) syllable, digit, CJK, and prosodic-pause codec frame estimator (12.5 Hz = 80ms/frame).
+static int estimate_speech_codec_frames(const char* text, float rate_scale) {
+    if (!text || text[0] == '\0') return 20;
+
+    double frames = 10.0; // Acoustic onset + trailing silence margin (~800ms)
+    int word_alpha_len = 0;
+    int word_vowel_groups = 0;
+    bool prev_vowel = false;
+    unsigned char prev_alpha = 0;
+    unsigned char prev_prev_alpha = 0;
+
+    const unsigned char* p = (const unsigned char*)text;
+    while (*p) {
+        unsigned char b = *p;
+        if (b < 0x80) {
+            if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '\'') {
+                if (b != '\'') {
+                    unsigned char lc = (unsigned char)(b | 0x20);
+                    bool v = is_ascii_vowel(lc);
+                    if (v && !prev_vowel) {
+                        word_vowel_groups++;
+                    }
+                    prev_vowel = v;
+                    prev_prev_alpha = prev_alpha;
+                    prev_alpha = lc;
+                    word_alpha_len++;
+                }
+                p++;
+                continue;
+            }
+
+            // Flush finished ASCII alphabetic word
+            if (word_alpha_len > 0) {
+                int syl = word_vowel_groups;
+                // Discount silent trailing '-e' (e.g., "make", "time", "voice", but keep "-le" as in "table")
+                if (word_alpha_len >= 4 && prev_alpha == 'e' && !is_ascii_vowel(prev_prev_alpha) && prev_prev_alpha != 'l' && syl > 1) {
+                    syl--;
+                }
+                if (syl < 1) syl = 1;
+                frames += (double)syl * 2.95;
+                word_alpha_len = 0;
+                word_vowel_groups = 0;
+                prev_vowel = false;
+                prev_alpha = 0;
+                prev_prev_alpha = 0;
+            }
+
+            if (b >= '0' && b <= '9') {
+                frames += 3.5; // Spoken digits average ~1.3 syllables (~280ms) each
+            } else if (b == ',' || b == ';' || b == ':') {
+                frames += 2.5; // Clause pause (~200ms)
+            } else if (b == '.' || b == '!' || b == '?') {
+                // Skip decimal points (3.14) and repeated ellipsis dots (...)
+                bool is_decimal = (b == '.' && p > (const unsigned char*)text &&
+                                   p[-1] >= '0' && p[-1] <= '9' && p[1] >= '0' && p[1] <= '9');
+                bool is_repeat_dot = (b == '.' && p[1] == '.');
+                if (!is_decimal && !is_repeat_dot) {
+                    frames += 4.5; // Sentence boundary pause (~360ms)
+                }
+            } else if (b == '\n') {
+                frames += 3.5;
+            }
+            p++;
+        } else {
+            // Flush any pending ASCII word
+            if (word_alpha_len > 0) {
+                int syl = word_vowel_groups > 0 ? word_vowel_groups : 1;
+                frames += (double)syl * 2.95;
+                word_alpha_len = 0;
+                word_vowel_groups = 0;
+                prev_vowel = false;
+                prev_alpha = 0;
+                prev_prev_alpha = 0;
+            }
+
+            // Decode UTF-8 codepoint
+            uint32_t cp = 0;
+            int adv = 1;
+            if ((b & 0xE0) == 0xC0 && (p[1] & 0xC0) == 0x80) {
+                cp = ((uint32_t)(b & 0x1F) << 6) | (uint32_t)(p[1] & 0x3F);
+                adv = 2;
+            } else if ((b & 0xF0) == 0xE0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) {
+                cp = ((uint32_t)(b & 0x0F) << 12) | ((uint32_t)(p[1] & 0x3F) << 6) | (uint32_t)(p[2] & 0x3F);
+                adv = 3;
+            } else if ((b & 0xF8) == 0xF0 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80) {
+                cp = ((uint32_t)(b & 0x07) << 18) | ((uint32_t)(p[1] & 0x3F) << 12) |
+                     ((uint32_t)(p[2] & 0x3F) << 6) | (uint32_t)(p[3] & 0x3F);
+                adv = 4;
+            }
+
+            if ((cp >= 0x3040 && cp <= 0x30FF) || // Hiragana & Katakana
+                (cp >= 0x3400 && cp <= 0x9FFF) || // CJK Ideographs
+                (cp >= 0xAC00 && cp <= 0xD7AF)) { // Hangul Syllables
+                frames += 3.4;
+            } else if (cp == 0x3002 || cp == 0xFF01 || cp == 0xFF1F) { // 。！？
+                frames += 4.5;
+            } else if (cp == 0x3001 || cp == 0xFF0C || cp == 0x2013 || cp == 0x2014) { // 、，–—
+                frames += 2.5;
+            } else if (cp >= 0x00C0 && cp <= 0x052F) { // Accented Latin / Greek / Cyrillic letters
+                frames += 0.95;
+            }
+            p += adv;
+        }
+    }
+
+    if (word_alpha_len > 0) {
+        int syl = word_vowel_groups;
+        if (word_alpha_len >= 4 && prev_alpha == 'e' && !is_ascii_vowel(prev_prev_alpha) && prev_prev_alpha != 'l' && syl > 1) {
+            syl--;
+        }
+        if (syl < 1) syl = 1;
+        frames += (double)syl * 2.95;
+    }
+
+    if (rate_scale > 0.1f) {
+        frames *= (double)rate_scale;
+    }
+    int est = (int)(frames + 0.5);
+    if (est < 12) est = 12;
+    if (est > 4096) est = 4096;
+    return est;
+}
+
+static double g_measured_voc_sec_per_frame = 0.0;
+
+static double estimate_vocode_to_gen_ratio(const char* model_name) {
+    if (!model_name) return 0.50;
+    const bool is_06b = (strstr(model_name, "0.6b") != NULL || strstr(model_name, "0.6B") != NULL);
+    const bool is_q4  = (strstr(model_name, "Q4") != NULL || strstr(model_name, "q4") != NULL);
+    const bool is_q8  = (strstr(model_name, "Q8") != NULL || strstr(model_name, "q8") != NULL);
+    if (is_06b) {
+        if (is_q4) return 1.12;
+        if (is_q8) return 0.88;
+        return 0.62;
+    }
+    if (is_q4) return 0.62;
+    if (is_q8) return 0.48;
+    return 0.34;
+}
+
 typedef struct {
+    int raw_estimated_frames;
     int estimated_frames;
     int last_tokens;
+    int actual_total_frames;
     int is_tty;
+    int is_streaming;
+    int64_t start_ns;
+    int64_t gen_start_ns;
+    int64_t vocode_start_ns;
+    int64_t last_render_ns;
+    double last_pct;
+    double vocode_start_pct;
+    double vocode_to_gen_ratio;
+    uint32_t spin_step;
 } tts_progress_t;
 
-static void on_progress(int tokens, int max_tokens, void* user_data) {
-    (void)max_tokens;
-    tts_progress_t* prog = (tts_progress_t*)user_data;
-    if (!prog) return;
+static void init_tts_progress(tts_progress_t* prog, const char* text, float rate_scale, int is_streaming, const char* model_name) {
+    memset(prog, 0, sizeof(*prog));
+    prog->is_tty = isatty(fileno(stderr));
+    prog->is_streaming = is_streaming;
+    prog->raw_estimated_frames = estimate_speech_codec_frames(text, 1.0f);
+    prog->estimated_frames = estimate_speech_codec_frames(text, rate_scale);
+    prog->vocode_to_gen_ratio = estimate_vocode_to_gen_ratio(model_name);
+    prog->start_ns = monotonic_now_ns();
+}
 
-    static const char* spinner[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
-    const int num_spinner = 10;
-    const char* spin = spinner[tokens % num_spinner];
-
-    int target = prog->estimated_frames > 0 ? prog->estimated_frames : 40;
-    if (tokens >= target) {
-        target = tokens + 8;
-        prog->estimated_frames = target;
-    }
-    int percent = (tokens * 100) / target;
-    if (percent > 99) percent = 99;
-    if (percent < 1) percent = 1;
-
-    int bar_width = 24;
-    int filled = (percent * bar_width) / 100;
-    char bar[32];
+static void render_progress_bar(char* bar, int bar_width, double pct) {
+    int filled = (int)((pct * (double)bar_width) / 100.0 + 0.5);
+    if (filled < 0) filled = 0;
+    if (filled > bar_width) filled = bar_width;
     for (int i = 0; i < bar_width; i++) {
         if (i < filled) bar[i] = '=';
-        else if (i == filled) bar[i] = '>';
+        else if (i == filled && filled < bar_width) bar[i] = '>';
         else bar[i] = ' ';
     }
     bar[bar_width] = '\0';
+}
 
-    float audio_sec = (float)tokens / 12.0f; // 12Hz speech tokenizer frame rate
+// Accurate 3-phase (Prefill -> Generate -> Vocode -> Done) progress callback.
+// Throttled to <= 20 FPS (50ms) via vDSO clock_gettime so CPU overhead is ~0.00%.
+static void on_phase_progress(int32_t phase, int32_t current, int32_t total, void* user_data) {
+    tts_progress_t* prog = (tts_progress_t*)user_data;
+    if (!prog) return;
 
-    if (prog->is_tty) {
-        fprintf(stderr, "\r\033[K[*] Synthesizing [%s] [%s] %2d%% (%d frames, ~%.1fs)",
-                spin, bar, percent, tokens, audio_sec);
-        fflush(stderr);
-    } else {
-        if (tokens == 1 || tokens % 20 == 0) {
-            fprintf(stderr, "[*] Synthesizing: %d frames (~%.1fs)...\n", tokens, audio_sec);
+    if (!prog->is_tty) {
+        if (phase == QWEN3_TTS_PHASE_GENERATE) {
+            prog->last_tokens = current;
+            if (current == 1 || current % 25 == 0) {
+                float audio_sec = (float)current / 12.5f;
+                fprintf(stderr, "[*] Synthesizing: %d frames (~%.1fs)...\n", current, audio_sec);
+                fflush(stderr);
+            }
+        } else if (phase == QWEN3_TTS_PHASE_VOCODE && current == 0 && total > 0) {
+            prog->actual_total_frames = total;
+            fprintf(stderr, "[*] Vocoding %d frames (%.1fs audio)...\n", total, (float)total / 12.5f);
             fflush(stderr);
+        } else if (phase == QWEN3_TTS_PHASE_DONE && total > 0) {
+            prog->actual_total_frames = total;
         }
+        return;
     }
-    prog->last_tokens = tokens;
+
+    const int64_t now_ns = monotonic_now_ns();
+    if (prog->start_ns == 0) prog->start_ns = now_ns;
+
+    // 50ms throttle during steady-state token/tile loops; never throttle phase transitions
+    const bool is_steady_gen = (phase == QWEN3_TTS_PHASE_GENERATE && current > 1);
+    const bool is_steady_voc = (phase == QWEN3_TTS_PHASE_VOCODE && current > 0 && current < total);
+    if ((is_steady_gen || is_steady_voc) && (now_ns - prog->last_render_ns) < 50000000LL) {
+        if (phase == QWEN3_TTS_PHASE_GENERATE) prog->last_tokens = current;
+        return;
+    }
+    prog->last_render_ns = now_ns;
+
+    static const char* spinner[] = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"};
+    const char* spin = spinner[(prog->spin_step++) % 10];
+    enum { BAR_WIDTH = 16 };
+    char bar[BAR_WIDTH + 1];
+
+    if (phase == QWEN3_TTS_PHASE_PREFILL) {
+        double pct = 2.0;
+        if (pct < prog->last_pct) pct = prog->last_pct;
+        prog->last_pct = pct;
+        render_progress_bar(bar, BAR_WIDTH, pct);
+        fprintf(stderr, "\r\033[K[*] Synthesizing [%s] [%s] %3d%% | Prefill...",
+                spin, bar, (int)(pct + 0.5));
+        fflush(stderr);
+        return;
+    }
+
+    if (phase == QWEN3_TTS_PHASE_GENERATE) {
+        if (prog->gen_start_ns == 0) prog->gen_start_ns = now_ns;
+        prog->last_tokens = current;
+
+        const bool streaming = (total < 0) || (prog->is_streaming != 0);
+        double voc_ratio = prog->vocode_to_gen_ratio > 0.05 ? prog->vocode_to_gen_ratio : 0.50;
+        double sec_per_frame = 0.0;
+        const bool have_gen_rate = (current >= 3 && (now_ns - prog->gen_start_ns) > 50000000LL);
+        if (have_gen_rate) {
+            sec_per_frame = ((double)(now_ns - prog->gen_start_ns) * 1e-9) / (double)(current - 1);
+            if (g_measured_voc_sec_per_frame > 0.001 && sec_per_frame > 0.001) {
+                voc_ratio = g_measured_voc_sec_per_frame / sec_per_frame;
+            }
+        }
+
+        const double span_lo = 3.0;
+        const double span_hi = streaming
+            ? 99.0
+            : (span_lo + 96.0 * (1.0 / (1.0 + voc_ratio)));
+        const double est = (double)(prog->estimated_frames > 8 ? prog->estimated_frames : 8);
+        const double r = (double)current / est;
+
+        // C1-smooth monotonic curve: linear up to 82% of estimate, smooth rational asymptote beyond
+        const double frac = (r <= 0.82)
+            ? r
+            : (0.82 + 0.18 * (r - 0.82) / ((r - 0.82) + 0.22));
+        double pct = span_lo + (span_hi - span_lo) * frac;
+        if (pct > span_hi) pct = span_hi;
+        if (pct < prog->last_pct) pct = prog->last_pct;
+        prog->last_pct = pct;
+
+        render_progress_bar(bar, BAR_WIDTH, pct);
+        const double audio_sec = (double)current / 12.5;
+        const double wall_sec = (double)(now_ns - prog->start_ns) * 1e-9;
+        const double rtf = wall_sec > 0.05 ? (audio_sec / wall_sec) : 0.0;
+
+        if (have_gen_rate) {
+            const double rem_gen_frames = (current < prog->estimated_frames)
+                ? (double)(prog->estimated_frames - current)
+                : fmax(3.0, 0.15 * (double)current);
+            const double expected_total = (double)current + rem_gen_frames;
+            const double voc_spf = (g_measured_voc_sec_per_frame > 0.001)
+                ? g_measured_voc_sec_per_frame
+                : (voc_ratio * sec_per_frame);
+            const double est_voc_sec = streaming ? 0.0 : (voc_spf * expected_total);
+            const double eta_sec = rem_gen_frames * sec_per_frame + est_voc_sec;
+            fprintf(stderr, "\r\033[K[*] Synthesizing [%s] [%s] %3d%% | Gen %.1fs | %.2fx RT | ETA %.1fs",
+                    spin, bar, (int)(pct + 0.5), audio_sec, rtf, eta_sec);
+        } else {
+            fprintf(stderr, "\r\033[K[*] Synthesizing [%s] [%s] %3d%% | Gen %.1fs | %.2fx RT",
+                    spin, bar, (int)(pct + 0.5), audio_sec, rtf);
+        }
+        fflush(stderr);
+        return;
+    }
+
+    if (phase == QWEN3_TTS_PHASE_VOCODE) {
+        if (total > 0) prog->actual_total_frames = total;
+        if (prog->vocode_start_ns == 0) {
+            prog->vocode_start_ns = now_ns;
+            const double default_voc_start = 3.0 + 96.0 * (1.0 / (1.0 + prog->vocode_to_gen_ratio));
+            prog->vocode_start_pct = prog->last_pct < (default_voc_start - 8.0)
+                ? (default_voc_start - 8.0)
+                : prog->last_pct;
+        }
+        const double v_frac = (total > 0) ? ((double)current / (double)total) : 0.0;
+        double pct = prog->vocode_start_pct + (99.4 - prog->vocode_start_pct) * v_frac;
+        if (pct > 99.4) pct = 99.4;
+        if (pct < prog->last_pct) pct = prog->last_pct;
+        prog->last_pct = pct;
+
+        render_progress_bar(bar, BAR_WIDTH, pct);
+        const double done_sec = (double)current / 12.5;
+        const double total_sec = (double)(total > 0 ? total : current) / 12.5;
+
+        if (current >= 4 && total > current && (now_ns - prog->vocode_start_ns) > 50000000LL) {
+            const double voc_dt = (double)(now_ns - prog->vocode_start_ns) * 1e-9;
+            const double eta_sec = (voc_dt / (double)current) * (double)(total - current);
+            fprintf(stderr, "\r\033[K[*] Synthesizing [%s] [%s] %3d%% | Vocode %.1f/%.1fs | ETA %.1fs",
+                    spin, bar, (int)(pct + 0.5), done_sec, total_sec, eta_sec);
+        } else {
+            fprintf(stderr, "\r\033[K[*] Synthesizing [%s] [%s] %3d%% | Vocode %.1f/%.1fs",
+                    spin, bar, (int)(pct + 0.5), done_sec, total_sec);
+        }
+        fflush(stderr);
+        return;
+    }
+
+    if (phase == QWEN3_TTS_PHASE_DONE) {
+        if (total > 0) prog->actual_total_frames = total;
+        if (prog->vocode_start_ns > 0 && prog->actual_total_frames >= 8) {
+            const double voc_sec = (double)(now_ns - prog->vocode_start_ns) * 1e-9;
+            const double obs_spf = voc_sec / (double)prog->actual_total_frames;
+            if (obs_spf > 0.001 && obs_spf < 2.0) {
+                g_measured_voc_sec_per_frame = (g_measured_voc_sec_per_frame > 0.001)
+                    ? (0.65 * g_measured_voc_sec_per_frame + 0.35 * obs_spf)
+                    : obs_spf;
+            }
+        }
+        prog->last_pct = 100.0;
+        render_progress_bar(bar, BAR_WIDTH, 100.0);
+        const double total_sec = (double)(total > 0 ? total : prog->last_tokens) / 12.5;
+        fprintf(stderr, "\r\033[K[*] Synthesizing [✓] [%s] 100%% | Done (%.1fs)",
+                bar, total_sec);
+        fflush(stderr);
+    }
 }
 
 static int dir_exists(const char *path) {
@@ -109,58 +433,74 @@ static void ensure_dir_exists(const char *path) {
 #endif
 }
 
-static FILE* open_settings_file(void) {
-    FILE *f = fopen("settings.json", "r");
+// Cache settings.json in memory once per process to avoid repeated file opens per parameter/chunk
+static const char* get_cached_settings_json(void) {
+    static int s_loaded = 0;
+    static char s_buf[8192];
+
+    if (s_loaded) {
+        return s_buf[0] != '\0' ? s_buf : NULL;
+    }
+    s_loaded = 1;
+    s_buf[0] = '\0';
+
+    FILE *f = fopen("settings.json", "rb");
     if (!f) {
         const char *base_dir = getenv("VOICECLI_BASE_DIR");
-        if (base_dir && strlen(base_dir) > 0) {
+        if (base_dir && base_dir[0] != '\0') {
             char p[4096];
             snprintf(p, sizeof(p), "%s%csettings.json", base_dir, PATH_SEP);
-            f = fopen(p, "r");
+            f = fopen(p, "rb");
         }
     }
-    return f;
+    if (f) {
+        size_t n = fread(s_buf, 1, sizeof(s_buf) - 1, f);
+        s_buf[n] = '\0';
+        fclose(f);
+        return s_buf;
+    }
+    return NULL;
+}
+
+static void format_env_key(const char *key, char *env_key, size_t env_key_size) {
+    snprintf(env_key, env_key_size, "VOICECLI_%s", key);
+    for (size_t i = 0; env_key[i]; i++) {
+        if (env_key[i] >= 'a' && env_key[i] <= 'z') env_key[i] -= 32;
+    }
 }
 
 static void get_setting_string(const char *key, char *out, size_t out_size, const char *default_val) {
     char env_key[128];
-    snprintf(env_key, sizeof(env_key), "VOICECLI_%s", key);
-    for (int i = 0; env_key[i]; i++) {
-        if (env_key[i] >= 'a' && env_key[i] <= 'z') env_key[i] -= 32;
-    }
+    format_env_key(key, env_key, sizeof(env_key));
     const char *env_val = getenv(env_key);
-    if (env_val && strlen(env_val) > 0) {
+    if (env_val && env_val[0] != '\0') {
         strncpy(out, env_val, out_size - 1);
         out[out_size - 1] = '\0';
         return;
     }
 
-    FILE *f = open_settings_file();
-    if (f) {
-        char line[512];
+    const char *json = get_cached_settings_json();
+    if (json) {
         char search_key[128];
         snprintf(search_key, sizeof(search_key), "\"%s\"", key);
-        while (fgets(line, sizeof(line), f)) {
-            char *pos = strstr(line, search_key);
-            if (pos) {
-                char *colon = strchr(pos + strlen(search_key), ':');
-                if (colon) {
-                    char *start = strchr(colon + 1, '"');
-                    if (start) {
-                        start++;
-                        char *end = strchr(start, '"');
-                        if (end) {
-                            *end = '\0';
-                            strncpy(out, start, out_size - 1);
-                            out[out_size - 1] = '\0';
-                            fclose(f);
-                            return;
-                        }
+        const char *pos = strstr(json, search_key);
+        if (pos) {
+            const char *colon = strchr(pos + strlen(search_key), ':');
+            if (colon) {
+                const char *start = strchr(colon + 1, '"');
+                if (start) {
+                    start++;
+                    const char *end = strchr(start, '"');
+                    if (end) {
+                        size_t len = (size_t)(end - start);
+                        if (len >= out_size) len = out_size - 1;
+                        memcpy(out, start, len);
+                        out[len] = '\0';
+                        return;
                     }
                 }
             }
         }
-        fclose(f);
     }
 
     strncpy(out, default_val, out_size - 1);
@@ -169,78 +509,58 @@ static void get_setting_string(const char *key, char *out, size_t out_size, cons
 
 static float get_setting_float(const char *key, float default_val) {
     char env_key[128];
-    snprintf(env_key, sizeof(env_key), "VOICECLI_%s", key);
-    for (int i = 0; env_key[i]; i++) {
-        if (env_key[i] >= 'a' && env_key[i] <= 'z') env_key[i] -= 32;
-    }
+    format_env_key(key, env_key, sizeof(env_key));
     const char *env_val = getenv(env_key);
-    if (env_val && strlen(env_val) > 0) {
+    if (env_val && env_val[0] != '\0') {
         char *endptr = NULL;
         float v = strtof(env_val, &endptr);
         if (endptr != env_val) return v;
     }
 
-    FILE *f = open_settings_file();
-    if (f) {
-        char line[512];
+    const char *json = get_cached_settings_json();
+    if (json) {
         char search_key[128];
         snprintf(search_key, sizeof(search_key), "\"%s\"", key);
-        while (fgets(line, sizeof(line), f)) {
-            char *pos = strstr(line, search_key);
-            if (pos) {
-                char *colon = strchr(pos + strlen(search_key), ':');
-                if (colon) {
-                    char *val_start = colon + 1;
-                    while (*val_start && (*val_start == ' ' || *val_start == '\t')) val_start++;
-                    char *endptr = NULL;
-                    float v = strtof(val_start, &endptr);
-                    if (endptr != val_start) {
-                        fclose(f);
-                        return v;
-                    }
-                }
+        const char *pos = strstr(json, search_key);
+        if (pos) {
+            const char *colon = strchr(pos + strlen(search_key), ':');
+            if (colon) {
+                const char *val_start = colon + 1;
+                while (*val_start == ' ' || *val_start == '\t') val_start++;
+                char *endptr = NULL;
+                float v = strtof(val_start, &endptr);
+                if (endptr != val_start) return v;
             }
         }
-        fclose(f);
     }
     return default_val;
 }
 
 static int32_t get_setting_int(const char *key, int32_t default_val) {
     char env_key[128];
-    snprintf(env_key, sizeof(env_key), "VOICECLI_%s", key);
-    for (int i = 0; env_key[i]; i++) {
-        if (env_key[i] >= 'a' && env_key[i] <= 'z') env_key[i] -= 32;
-    }
+    format_env_key(key, env_key, sizeof(env_key));
     const char *env_val = getenv(env_key);
-    if (env_val && strlen(env_val) > 0) {
+    if (env_val && env_val[0] != '\0') {
         char *endptr = NULL;
         long v = strtol(env_val, &endptr, 10);
         if (endptr != env_val) return (int32_t)v;
     }
 
-    FILE *f = open_settings_file();
-    if (f) {
-        char line[512];
+    const char *json = get_cached_settings_json();
+    if (json) {
         char search_key[128];
         snprintf(search_key, sizeof(search_key), "\"%s\"", key);
-        while (fgets(line, sizeof(line), f)) {
-            char *pos = strstr(line, search_key);
-            if (pos) {
-                char *colon = strchr(pos + strlen(search_key), ':');
-                if (colon) {
-                    char *val_start = colon + 1;
-                    while (*val_start && (*val_start == ' ' || *val_start == '\t')) val_start++;
-                    char *endptr = NULL;
-                    long v = strtol(val_start, &endptr, 10);
-                    if (endptr != val_start) {
-                        fclose(f);
-                        return (int32_t)v;
-                    }
-                }
+        const char *pos = strstr(json, search_key);
+        if (pos) {
+            const char *colon = strchr(pos + strlen(search_key), ':');
+            if (colon) {
+                const char *val_start = colon + 1;
+                while (*val_start == ' ' || *val_start == '\t') val_start++;
+                char *endptr = NULL;
+                long v = strtol(val_start, &endptr, 10);
+                if (endptr != val_start) return (int32_t)v;
             }
         }
-        fclose(f);
     }
     return default_val;
 }
@@ -285,7 +605,10 @@ static void resolve_model_preset(const char *mode, const char *override_str, cha
         }
 
         const char *size_part = "1.7b";
-        if (strstr(lower, "0.6b") != NULL || strcmp(lower, "fast") == 0 || strcmp(lower, "small") == 0) {
+        if (strstr(lower, "0.6b") != NULL ||
+            strcmp(lower, "fast") == 0 ||
+            strcmp(lower, "small") == 0 ||
+            strcmp(lower, "tiny") == 0) {
             size_part = "0.6b";
         }
         const char *quant_part = "BF16";
@@ -547,6 +870,76 @@ static char* prepare_reference_audio(const char *audio_path, int *is_temp) {
     return strdup(audio_path);
 }
 
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("avx2,fma")))
+static float sola_dot_product_avx2(const float* a, const float* b, int n) {
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    int j = 0;
+    for (; j + 15 < n; j += 16) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + j),     _mm256_loadu_ps(b + j),     acc0);
+        acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(a + j + 8), _mm256_loadu_ps(b + j + 8), acc1);
+    }
+    for (; j + 7 < n; j += 8) {
+        acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(a + j), _mm256_loadu_ps(b + j), acc0);
+    }
+    acc0 = _mm256_add_ps(acc0, acc1);
+    __m128 lo = _mm256_castps256_ps128(acc0);
+    __m128 hi = _mm256_extractf128_ps(acc0, 1);
+    __m128 sum4 = _mm_add_ps(lo, hi);
+    __m128 shuf = _mm_movehdup_ps(sum4);
+    __m128 sums = _mm_add_ps(sum4, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    float dot = _mm_cvtss_f32(sums);
+    for (; j < n; j++) {
+        dot += a[j] * b[j];
+    }
+    return dot;
+}
+#endif
+
+static float sola_dot_product_base(const float* a, const float* b, int n) {
+#if defined(__x86_64__) || defined(_M_X64)
+    __m128 acc0 = _mm_setzero_ps();
+    __m128 acc1 = _mm_setzero_ps();
+    int j = 0;
+    for (; j + 7 < n; j += 8) {
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(_mm_loadu_ps(a + j),     _mm_loadu_ps(b + j)));
+        acc1 = _mm_add_ps(acc1, _mm_mul_ps(_mm_loadu_ps(a + j + 4), _mm_loadu_ps(b + j + 4)));
+    }
+    acc0 = _mm_add_ps(acc0, acc1);
+    __m128 shuf = _mm_shuffle_ps(acc0, acc0, _MM_SHUFFLE(2, 3, 0, 1));
+    __m128 sums = _mm_add_ps(acc0, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    float dot = _mm_cvtss_f32(sums);
+    for (; j < n; j++) {
+        dot += a[j] * b[j];
+    }
+    return dot;
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    int j = 0;
+    for (; j + 7 < n; j += 8) {
+        acc0 = vmlaq_f32(acc0, vld1q_f32(a + j),     vld1q_f32(b + j));
+        acc1 = vmlaq_f32(acc1, vld1q_f32(a + j + 4), vld1q_f32(b + j + 4));
+    }
+    float dot = vaddvq_f32(vaddq_f32(acc0, acc1));
+    for (; j < n; j++) {
+        dot += a[j] * b[j];
+    }
+    return dot;
+#else
+    float dot = 0.0f;
+    for (int j = 0; j < n; j++) {
+        dot += a[j] * b[j];
+    }
+    return dot;
+#endif
+}
+
 static float* apply_sola_timestretch(const float* in_samples, int in_len, int sample_rate, float speed, int* out_len) {
     if (!in_samples || in_len <= 0) {
         *out_len = 0;
@@ -612,6 +1005,13 @@ static float* apply_sola_timestretch(const float* in_samples, int in_len, int sa
         return NULL;
     }
 
+    float (*dot_fn)(const float*, const float*, int) = sola_dot_product_base;
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
+    if (voicecli_get_active_simd_tier() >= 2) {
+        dot_fn = sola_dot_product_avx2;
+    }
+#endif
+
     memcpy(y, in_samples, (size_t)W * sizeof(float));
     int out_pos = S_s;
     int in_pos = S_a;
@@ -626,11 +1026,7 @@ static float* apply_sola_timestretch(const float* in_samples, int in_len, int sa
             int actual_idx = in_pos + k;
             if (actual_idx < 0 || actual_idx + L > in_len) continue;
 
-            const float* x_ptr = in_samples + actual_idx;
-            float dot = 0.0f;
-            for (int j = 0; j < L; j++) {
-                dot += y_ptr[j] * x_ptr[j];
-            }
+            float dot = dot_fn(y_ptr, in_samples + actual_idx, L);
             float norm_cand = (float)(prefix_sq[actual_idx + L] - prefix_sq[actual_idx]);
             float score = dot / (sqrtf(fmaxf(0.0f, norm_cand)) + 1e-6f);
             if (score > best_corr) {
@@ -646,11 +1042,7 @@ static float* apply_sola_timestretch(const float* in_samples, int in_len, int sa
             int actual_idx = in_pos + k;
             if (actual_idx < 0 || actual_idx + L > in_len) continue;
 
-            const float* x_ptr = in_samples + actual_idx;
-            float dot = 0.0f;
-            for (int j = 0; j < L; j++) {
-                dot += y_ptr[j] * x_ptr[j];
-            }
+            float dot = dot_fn(y_ptr, in_samples + actual_idx, L);
             float norm_cand = (float)(prefix_sq[actual_idx + L] - prefix_sq[actual_idx]);
             float score = dot / (sqrtf(fmaxf(0.0f, norm_cand)) + 1e-6f);
             if (score > best_corr) {
@@ -742,6 +1134,17 @@ static void build_style_prompt(const char* prompt, float speed, char* final_prom
     }
 }
 
+static float update_adaptive_speech_rate(float current_scale, const tts_progress_t* prog) {
+    int actual = prog->actual_total_frames > 0 ? prog->actual_total_frames : prog->last_tokens;
+    if (actual >= 10 && prog->raw_estimated_frames >= 10) {
+        float observed = (float)actual / (float)prog->raw_estimated_frames;
+        if (observed < 0.45f) observed = 0.45f;
+        if (observed > 2.20f) observed = 2.20f;
+        return 0.35f * current_scale + 0.65f * observed;
+    }
+    return current_scale;
+}
+
 static void append_chunk_audio(
     float** full_audio,
     size_t* total_samples,
@@ -776,26 +1179,6 @@ static void append_chunk_audio(
         start = 0;
     }
 
-    float* temp = (float*)malloc((size_t)clean_len * sizeof(float));
-    if (!temp) return;
-    memcpy(temp, chunk_audio + start, (size_t)clean_len * sizeof(float));
-
-    // Smooth Hann fade-in (15ms)
-    int fade_in = (int)(sample_rate * 0.015f);
-    if (fade_in > clean_len / 2) fade_in = clean_len / 2;
-    for (int j = 0; j < fade_in; j++) {
-        float factor = 0.5f * (1.0f - cosf((float)M_PI * (float)j / (float)fade_in));
-        temp[j] *= factor;
-    }
-
-    // Smooth Hann fade-out (20ms)
-    int fade_out = (int)(sample_rate * 0.020f);
-    if (fade_out > clean_len / 2) fade_out = clean_len / 2;
-    for (int j = 0; j < fade_out; j++) {
-        float factor = 0.5f * (1.0f + cosf((float)M_PI * (float)j / (float)fade_out));
-        temp[clean_len - fade_out + j] *= factor;
-    }
-
     // Natural 150ms breathing pause between chunks
     int silence_samples = is_last_chunk ? 0 : (int)(sample_rate * 0.15f);
 
@@ -805,22 +1188,36 @@ static void append_chunk_audio(
         float* new_buf = (float*)realloc(*full_audio, new_cap * sizeof(float));
         if (!new_buf) {
             fprintf(stderr, "[-] Error: Failed to reallocate audio buffer\n");
-            free(temp);
             return;
         }
         *full_audio = new_buf;
         *audio_capacity = new_cap;
     }
 
-    memcpy(*full_audio + *total_samples, temp, (size_t)clean_len * sizeof(float));
+    // Copy directly into destination buffer and apply Hann fades in-place (zero intermediate malloc)
+    float* dst = *full_audio + *total_samples;
+    memcpy(dst, chunk_audio + start, (size_t)clean_len * sizeof(float));
+
+    int fade_in = (int)(sample_rate * 0.015f);
+    if (fade_in > clean_len / 2) fade_in = clean_len / 2;
+    for (int j = 0; j < fade_in; j++) {
+        float factor = 0.5f * (1.0f - cosf((float)M_PI * (float)j / (float)fade_in));
+        dst[j] *= factor;
+    }
+
+    int fade_out = (int)(sample_rate * 0.020f);
+    if (fade_out > clean_len / 2) fade_out = clean_len / 2;
+    for (int j = 0; j < fade_out; j++) {
+        float factor = 0.5f * (1.0f + cosf((float)M_PI * (float)j / (float)fade_out));
+        dst[clean_len - fade_out + j] *= factor;
+    }
+
     *total_samples += (size_t)clean_len;
 
     if (silence_samples > 0) {
         memset(*full_audio + *total_samples, 0, (size_t)silence_samples * sizeof(float));
         *total_samples += (size_t)silence_samples;
     }
-
-    free(temp);
 }
 
 typedef struct {
@@ -936,11 +1333,8 @@ int c_generate_style_ex(const char* text, const char* prompt, const voicecli_opt
     }
 
     tts_progress_t prog;
-    prog.is_tty = isatty(fileno(stderr));
-    prog.last_tokens = 0;
-    int text_len = text ? (int)strlen(text) : 20;
-    prog.estimated_frames = text_len < 24 ? 24 : text_len;
-    qwen3_tts_set_progress_callback(ctx, on_progress, &prog);
+    init_tts_progress(&prog, text, 1.0f, (opts && opts->stream) ? 1 : 0, model_name);
+    qwen3_tts_set_phase_progress_callback(ctx, on_phase_progress, &prog);
 
     qwen3_tts_params_t params = build_tts_params(opts, final_prompt, NULL);
     qwen3_tts_result_t result;
@@ -1047,6 +1441,8 @@ int c_generate_style_chunked_ex(const char** chunks, int num_chunks, const char*
         return 1;
     }
     int sample_rate = 24000;
+    float speech_rate_scale = 1.0f;
+    qwen3_tts_params_t params = build_tts_params(opts, final_prompt, NULL);
 
     for (int i = 0; i < num_chunks; i++) {
         char preview[64];
@@ -1055,13 +1451,9 @@ int c_generate_style_chunked_ex(const char** chunks, int num_chunks, const char*
         fprintf(stderr, "\n[*] Chunk [%d/%d] (%zu chars): \"%s\"\n", i + 1, num_chunks, strlen(chunks[i]), preview);
 
         tts_progress_t prog;
-        prog.is_tty = isatty(fileno(stderr));
-        prog.last_tokens = 0;
-        int text_len = (int)strlen(chunks[i]);
-        prog.estimated_frames = text_len < 24 ? 24 : text_len;
-        qwen3_tts_set_progress_callback(ctx, on_progress, &prog);
+        init_tts_progress(&prog, chunks[i], speech_rate_scale, 0, model_name);
+        qwen3_tts_set_phase_progress_callback(ctx, on_phase_progress, &prog);
 
-        qwen3_tts_params_t params = build_tts_params(opts, final_prompt, NULL);
         qwen3_tts_result_t result = qwen3_tts_synthesize(ctx, chunks[i], params);
         if (!result.success || result.audio_len <= 0) {
             if (prog.is_tty) fprintf(stderr, "\r\033[K");
@@ -1071,6 +1463,7 @@ int c_generate_style_chunked_ex(const char** chunks, int num_chunks, const char*
             continue;
         }
 
+        speech_rate_scale = update_adaptive_speech_rate(speech_rate_scale, &prog);
         sample_rate = result.sample_rate;
         double chunk_sec = (double)result.audio_len / (double)result.sample_rate;
         double wall_sec = (double)result.t_total_ms / 1000.0;
@@ -1147,16 +1540,18 @@ static qwen3_tts_result_t execute_clone_synthesis(
     qwen3_tts_context_t* ctx,
     const char* text,
     const char* effective_audio_path,
+    const char* inline_ref_text,
     const char* active_profile_path,
     int is_icl_profile,
     qwen3_tts_params_t params,
-    const voicecli_options_t* opts
+    int use_stream,
+    float stream_chunk_sec
 ) {
-    if (opts && opts->stream) {
+    if (use_stream) {
         qwen3_tts_streaming_params_t sparams;
         memset(&sparams, 0, sizeof(sparams));
         sparams.generation = params;
-        sparams.chunk_sec = opts->stream_chunk_sec > 0.0f ? opts->stream_chunk_sec : 1.0f;
+        sparams.chunk_sec = stream_chunk_sec > 0.0f ? stream_chunk_sec : 1.0f;
         sparams.left_context_sec = 2.0f;
         sparams.collect_audio = 1;
         stream_ctx_t sctx = {0, 0};
@@ -1168,6 +1563,9 @@ static qwen3_tts_result_t execute_clone_synthesis(
                 return qwen3_tts_synthesize_with_speaker_embedding_streaming(ctx, text, active_profile_path, sparams, on_audio_stream_chunk, &sctx);
             }
         }
+        if (inline_ref_text && strlen(inline_ref_text) > 0) {
+            return qwen3_tts_synthesize_with_voice_icl_streaming(ctx, text, effective_audio_path, inline_ref_text, sparams, on_audio_stream_chunk, &sctx);
+        }
         return qwen3_tts_synthesize_with_voice_streaming(ctx, text, effective_audio_path, sparams, on_audio_stream_chunk, &sctx);
     } else {
         if (active_profile_path && strlen(active_profile_path) > 0) {
@@ -1176,6 +1574,9 @@ static qwen3_tts_result_t execute_clone_synthesis(
             } else {
                 return qwen3_tts_synthesize_with_speaker_embedding(ctx, text, active_profile_path, params);
             }
+        }
+        if (inline_ref_text && strlen(inline_ref_text) > 0) {
+            return qwen3_tts_synthesize_with_voice_icl(ctx, text, effective_audio_path, inline_ref_text, params);
         }
         return qwen3_tts_synthesize_with_voice(ctx, text, effective_audio_path, params);
     }
@@ -1226,8 +1627,7 @@ int c_generate_clone_ex(const char* text, const char* audio_path, const voicecli
     int is_temp_wav = 0;
     char* prepared_audio = NULL;
     const char* active_profile = (opts && opts->voice_profile && strlen(opts->voice_profile) > 0) ? opts->voice_profile : NULL;
-    char temp_icl_profile[4096] = {0};
-    int is_temp_icl = 0;
+    const char* inline_ref_text = NULL;
     int is_icl_profile = 0;
 
     if (active_profile) {
@@ -1239,25 +1639,19 @@ int c_generate_clone_ex(const char* text, const char* audio_path, const voicecli
         fprintf(stderr, "[*] Cloning voice from reference audio: %s\n", audio_path);
 
         if (opts && opts->ref_text && strlen(opts->ref_text) > 0) {
-            const char* out_prof = (opts->save_profile && strlen(opts->save_profile) > 0) ? opts->save_profile : NULL;
-            if (!out_prof) {
-#ifdef _WIN32
-                snprintf(temp_icl_profile, sizeof(temp_icl_profile), "voicecli_icl_%d.json", (int)getpid());
-#else
-                snprintf(temp_icl_profile, sizeof(temp_icl_profile), "/tmp/voicecli_icl_%d.json", (int)getpid());
-#endif
-                out_prof = temp_icl_profile;
-                is_temp_icl = 1;
-            }
-            fprintf(stderr, "[*] Extracting full ICL prompt (speaker embedding + reference speech codes)...\n");
-            if (qwen3_tts_extract_icl_prompt(ctx, prepared_audio, opts->ref_text, out_prof)) {
-                active_profile = out_prof;
-                is_icl_profile = 1;
-                if (!is_temp_icl) {
-                    fprintf(stderr, "[+] Saved reusable ICL voice profile to: %s\n", out_prof);
+            if (opts->save_profile && strlen(opts->save_profile) > 0) {
+                fprintf(stderr, "[*] Extracting and saving full ICL voice profile to: %s\n", opts->save_profile);
+                if (qwen3_tts_extract_icl_prompt(ctx, prepared_audio, opts->ref_text, opts->save_profile)) {
+                    active_profile = opts->save_profile;
+                    is_icl_profile = 1;
+                    fprintf(stderr, "[+] Saved reusable ICL voice profile to: %s\n", opts->save_profile);
+                } else {
+                    fprintf(stderr, "[-] Warning: ICL profile save failed; using in-memory ICL prompt.\n");
+                    inline_ref_text = opts->ref_text;
                 }
             } else {
-                fprintf(stderr, "[-] Warning: ICL prompt extraction failed; falling back to speaker embedding.\n");
+                // Zero-disk-I/O in-memory Full-ICL extraction via Qwen3TTS voice_prompt_cache_
+                inline_ref_text = opts->ref_text;
             }
         } else if (opts && opts->save_profile && strlen(opts->save_profile) > 0) {
             fprintf(stderr, "[*] Extracting and saving speaker embedding profile to: %s\n", opts->save_profile);
@@ -1275,16 +1669,17 @@ int c_generate_clone_ex(const char* text, const char* audio_path, const voicecli
         fprintf(stderr, "[*] Speech speed multiplier: %.2fx\n", speed);
     }
 
+    int use_stream = (opts && opts->stream) ? 1 : 0;
+    float stream_chunk_sec = (opts && opts->stream_chunk_sec > 0.0f) ? opts->stream_chunk_sec : 1.0f;
+
     tts_progress_t prog;
-    prog.is_tty = isatty(fileno(stderr));
-    prog.last_tokens = 0;
-    int text_len = text ? (int)strlen(text) : 20;
-    prog.estimated_frames = text_len < 24 ? 24 : text_len;
-    qwen3_tts_set_progress_callback(ctx, on_progress, &prog);
+    init_tts_progress(&prog, text, 1.0f, use_stream, model_name);
+    qwen3_tts_set_phase_progress_callback(ctx, on_phase_progress, &prog);
 
     qwen3_tts_params_t params = build_tts_params(opts, NULL, NULL);
     qwen3_tts_result_t result = execute_clone_synthesis(
-        ctx, text, prepared_audio, active_profile, is_icl_profile, params, opts
+        ctx, text, prepared_audio, inline_ref_text, active_profile, is_icl_profile,
+        params, use_stream, stream_chunk_sec
     );
 
     int rc = 0;
@@ -1297,7 +1692,6 @@ int c_generate_clone_ex(const char* text, const char* audio_path, const voicecli
     }
 
     if (is_temp_wav && prepared_audio) remove(prepared_audio);
-    if (is_temp_icl && temp_icl_profile[0]) remove(temp_icl_profile);
     if (prepared_audio) free(prepared_audio);
     qwen3_tts_free_result(result);
     qwen3_tts_free(ctx);
@@ -1339,8 +1733,7 @@ int c_generate_clone_chunked_ex(const char** chunks, int num_chunks, const char*
     int is_temp_wav = 0;
     char* prepared_audio = NULL;
     const char* active_profile = (opts && opts->voice_profile && strlen(opts->voice_profile) > 0) ? opts->voice_profile : NULL;
-    char temp_icl_profile[4096] = {0};
-    int is_temp_icl = 0;
+    const char* inline_ref_text = NULL;
     int is_icl_profile = 0;
 
     if (active_profile) {
@@ -1352,23 +1745,18 @@ int c_generate_clone_chunked_ex(const char** chunks, int num_chunks, const char*
         fprintf(stderr, "[*] Cloning voice from reference audio: %s\n", audio_path);
 
         if (opts && opts->ref_text && strlen(opts->ref_text) > 0) {
-            const char* out_prof = (opts->save_profile && strlen(opts->save_profile) > 0) ? opts->save_profile : NULL;
-            if (!out_prof) {
-#ifdef _WIN32
-                snprintf(temp_icl_profile, sizeof(temp_icl_profile), "voicecli_icl_%d.json", (int)getpid());
-#else
-                snprintf(temp_icl_profile, sizeof(temp_icl_profile), "/tmp/voicecli_icl_%d.json", (int)getpid());
-#endif
-                out_prof = temp_icl_profile;
-                is_temp_icl = 1;
-            }
-            fprintf(stderr, "[*] Extracting full ICL prompt once for all %d chunks...\n", num_chunks);
-            if (qwen3_tts_extract_icl_prompt(ctx, prepared_audio, opts->ref_text, out_prof)) {
-                active_profile = out_prof;
-                is_icl_profile = 1;
-                if (!is_temp_icl) {
-                    fprintf(stderr, "[+] Saved reusable ICL voice profile to: %s\n", out_prof);
+            if (opts->save_profile && strlen(opts->save_profile) > 0) {
+                fprintf(stderr, "[*] Extracting and saving full ICL voice profile to: %s\n", opts->save_profile);
+                if (qwen3_tts_extract_icl_prompt(ctx, prepared_audio, opts->ref_text, opts->save_profile)) {
+                    active_profile = opts->save_profile;
+                    is_icl_profile = 1;
+                    fprintf(stderr, "[+] Saved reusable ICL voice profile to: %s\n", opts->save_profile);
+                } else {
+                    inline_ref_text = opts->ref_text;
                 }
+            } else {
+                // Cached in RAM across all chunks via Qwen3TTS voice_prompt_cache_
+                inline_ref_text = opts->ref_text;
             }
         } else if (opts && opts->save_profile && strlen(opts->save_profile) > 0) {
             fprintf(stderr, "[*] Extracting and saving speaker embedding profile to: %s\n", opts->save_profile);
@@ -1391,12 +1779,13 @@ int c_generate_clone_chunked_ex(const char** chunks, int num_chunks, const char*
     if (!full_audio) {
         fprintf(stderr, "[-] Error: Failed to allocate audio buffer\n");
         if (is_temp_wav && prepared_audio) remove(prepared_audio);
-        if (is_temp_icl && temp_icl_profile[0]) remove(temp_icl_profile);
         if (prepared_audio) free(prepared_audio);
         qwen3_tts_free(ctx);
         return 1;
     }
     int sample_rate = 24000;
+    float speech_rate_scale = 1.0f;
+    qwen3_tts_params_t params = build_tts_params(opts, NULL, NULL);
 
     for (int i = 0; i < num_chunks; i++) {
         char preview[64];
@@ -1405,15 +1794,12 @@ int c_generate_clone_chunked_ex(const char** chunks, int num_chunks, const char*
         fprintf(stderr, "\n[*] Chunk [%d/%d] (%zu chars): \"%s\"\n", i + 1, num_chunks, strlen(chunks[i]), preview);
 
         tts_progress_t prog;
-        prog.is_tty = isatty(fileno(stderr));
-        prog.last_tokens = 0;
-        int text_len = (int)strlen(chunks[i]);
-        prog.estimated_frames = text_len < 24 ? 24 : text_len;
-        qwen3_tts_set_progress_callback(ctx, on_progress, &prog);
+        init_tts_progress(&prog, chunks[i], speech_rate_scale, 0, model_name);
+        qwen3_tts_set_phase_progress_callback(ctx, on_phase_progress, &prog);
 
-        qwen3_tts_params_t params = build_tts_params(opts, NULL, NULL);
         qwen3_tts_result_t result = execute_clone_synthesis(
-            ctx, chunks[i], prepared_audio, active_profile, is_icl_profile, params, NULL
+            ctx, chunks[i], prepared_audio, inline_ref_text, active_profile, is_icl_profile,
+            params, 0, 1.0f
         );
 
         if (!result.success || result.audio_len <= 0) {
@@ -1424,6 +1810,7 @@ int c_generate_clone_chunked_ex(const char** chunks, int num_chunks, const char*
             continue;
         }
 
+        speech_rate_scale = update_adaptive_speech_rate(speech_rate_scale, &prog);
         sample_rate = result.sample_rate;
         double chunk_sec = (double)result.audio_len / (double)result.sample_rate;
         double wall_sec = (double)result.t_total_ms / 1000.0;
@@ -1492,7 +1879,6 @@ int c_generate_clone_chunked_ex(const char** chunks, int num_chunks, const char*
     }
 
     if (is_temp_wav && prepared_audio) remove(prepared_audio);
-    if (is_temp_icl && temp_icl_profile[0]) remove(temp_icl_profile);
     if (prepared_audio) free(prepared_audio);
     free(full_audio);
     qwen3_tts_free(ctx);
@@ -1504,11 +1890,31 @@ int c_generate_speak_ex(const char* text, const char* speaker, const char* promp
 
     char model_name[256];
     resolve_model_preset("speak", opts ? opts->model_override : NULL, model_name, sizeof(model_name));
+    const char* model_dir = resolve_model_dir();
+
+    // Fast path for --list-speakers: inspect GGUF metadata header in <5ms without loading weights or vocoder
+    if (!speaker || strlen(speaker) == 0 || strcmp(speaker, "list") == 0) {
+        if (ensure_file_exists(model_dir, model_name) != 0) {
+            return 1;
+        }
+        char* speakers = qwen3_tts_list_speakers_from_model(model_dir, model_name);
+        if (!speakers) {
+            fprintf(stderr, "[-] Error: Failed to inspect model metadata '%s' in '%s'\n", model_name, model_dir);
+            return 1;
+        }
+        printf("Available built-in speakers in '%s':\n", model_name);
+        if (speakers[0] != '\0') {
+            printf("%s\n", speakers);
+        } else {
+            printf("  (No named speakers found in model metadata)\n");
+        }
+        qwen3_tts_free_string(speakers);
+        return 0;
+    }
 
     fprintf(stderr, "[*] Loading CustomVoice model: %s ...\n", model_name);
     fprintf(stderr, "[*] Target device: CPU (In-Process Native C++ / GGML SIMD: %s)\n", voicecli_get_active_simd_name());
 
-    const char* model_dir = resolve_model_dir();
     char tok_name[256];
     get_setting_string("tokenizer_model", tok_name, sizeof(tok_name), "qwen-tokenizer-12hz-BF16.gguf");
 
@@ -1530,20 +1936,6 @@ int c_generate_speak_ex(const char* text, const char* speaker, const char* promp
     }
     fprintf(stderr, "[+] Model loaded successfully.\n");
 
-    // If speaker is empty or "list", list available speakers
-    if (!speaker || strlen(speaker) == 0 || strcmp(speaker, "list") == 0) {
-        char* speakers = qwen3_tts_get_available_speakers(ctx);
-        printf("Available built-in speakers in '%s':\n", model_name);
-        if (speakers && strlen(speakers) > 0) {
-            printf("%s\n", speakers);
-        } else {
-            printf("  (No named speakers found in model metadata)\n");
-        }
-        qwen3_tts_free_string(speakers);
-        qwen3_tts_free(ctx);
-        return 0;
-    }
-
     float speed = opts ? opts->speed : 1.0f;
     char final_prompt[1024];
     build_style_prompt(prompt, speed, final_prompt, sizeof(final_prompt));
@@ -1554,15 +1946,25 @@ int c_generate_speak_ex(const char* text, const char* speaker, const char* promp
         fprintf(stderr, "[*] Voice steering instruction: \"%s\"\n", final_prompt);
     }
 
+    int use_stream = (opts && opts->stream) ? 1 : 0;
     tts_progress_t prog;
-    prog.is_tty = isatty(fileno(stderr));
-    prog.last_tokens = 0;
-    int text_len = text ? (int)strlen(text) : 20;
-    prog.estimated_frames = text_len < 24 ? 24 : text_len;
-    qwen3_tts_set_progress_callback(ctx, on_progress, &prog);
+    init_tts_progress(&prog, text, 1.0f, use_stream, model_name);
+    qwen3_tts_set_phase_progress_callback(ctx, on_phase_progress, &prog);
 
     qwen3_tts_params_t params = build_tts_params(opts, final_prompt, speaker);
-    qwen3_tts_result_t result = qwen3_tts_synthesize(ctx, text, params);
+    qwen3_tts_result_t result;
+    if (use_stream) {
+        qwen3_tts_streaming_params_t sparams;
+        memset(&sparams, 0, sizeof(sparams));
+        sparams.generation = params;
+        sparams.chunk_sec = (opts && opts->stream_chunk_sec > 0.0f) ? opts->stream_chunk_sec : 1.0f;
+        sparams.left_context_sec = 2.0f;
+        sparams.collect_audio = 1;
+        stream_ctx_t sctx = {0, 0};
+        result = qwen3_tts_synthesize_streaming(ctx, text, sparams, on_audio_stream_chunk, &sctx);
+    } else {
+        result = qwen3_tts_synthesize(ctx, text, params);
+    }
 
     int rc = 0;
     if (!result.success || result.audio_len <= 0) {
@@ -1616,6 +2018,8 @@ int c_generate_speak_chunked_ex(const char** chunks, int num_chunks, const char*
         return 1;
     }
     int sample_rate = 24000;
+    float speech_rate_scale = 1.0f;
+    qwen3_tts_params_t params = build_tts_params(opts, final_prompt, speaker);
 
     for (int i = 0; i < num_chunks; i++) {
         char preview[64];
@@ -1623,13 +2027,9 @@ int c_generate_speak_chunked_ex(const char** chunks, int num_chunks, const char*
         fprintf(stderr, "\n[*] Chunk [%d/%d] (%zu chars): \"%s\"\n", i + 1, num_chunks, strlen(chunks[i]), preview);
 
         tts_progress_t prog;
-        prog.is_tty = isatty(fileno(stderr));
-        prog.last_tokens = 0;
-        int text_len = (int)strlen(chunks[i]);
-        prog.estimated_frames = text_len < 24 ? 24 : text_len;
-        qwen3_tts_set_progress_callback(ctx, on_progress, &prog);
+        init_tts_progress(&prog, chunks[i], speech_rate_scale, 0, model_name);
+        qwen3_tts_set_phase_progress_callback(ctx, on_phase_progress, &prog);
 
-        qwen3_tts_params_t params = build_tts_params(opts, final_prompt, speaker);
         qwen3_tts_result_t result = qwen3_tts_synthesize(ctx, chunks[i], params);
         if (!result.success || result.audio_len <= 0) {
             if (prog.is_tty) fprintf(stderr, "\r\033[K");
@@ -1638,6 +2038,8 @@ int c_generate_speak_chunked_ex(const char** chunks, int num_chunks, const char*
             qwen3_tts_free_result(result);
             continue;
         }
+
+        speech_rate_scale = update_adaptive_speech_rate(speech_rate_scale, &prog);
         sample_rate = result.sample_rate;
         double chunk_sec = (double)result.audio_len / (double)result.sample_rate;
         double wall_sec = (double)result.t_total_ms / 1000.0;
@@ -1687,15 +2089,22 @@ int c_generate_speak_chunked_ex(const char** chunks, int num_chunks, const char*
 
 int c_extract_profile(const char* audio_path, const char* ref_text, const char* output_profile_path, const char* model_override) {
     if (!audio_path || !output_profile_path) return 1;
+    configure_runtime_threads(0);
 
     char model_name[256];
     resolve_model_preset("clone", model_override, model_name, sizeof(model_name));
     const char* model_dir = resolve_model_dir();
-    char tok_name[256];
-    get_setting_string("tokenizer_model", tok_name, sizeof(tok_name), "qwen-tokenizer-12hz-BF16.gguf");
+    const bool need_icl = (ref_text && strlen(ref_text) > 0);
 
-    if (ensure_file_exists(model_dir, tok_name) != 0 || ensure_file_exists(model_dir, model_name) != 0) {
+    if (ensure_file_exists(model_dir, model_name) != 0) {
         return 1;
+    }
+    if (need_icl) {
+        char tok_name[256];
+        get_setting_string("tokenizer_model", tok_name, sizeof(tok_name), "qwen-tokenizer-12hz-BF16.gguf");
+        if (ensure_file_exists(model_dir, tok_name) != 0) {
+            return 1;
+        }
     }
 
     qwen3_tts_context_t* ctx = qwen3_tts_init();
@@ -1705,7 +2114,7 @@ int c_extract_profile(const char* audio_path, const char* ref_text, const char* 
     char* prepared_audio = prepare_reference_audio(audio_path, &is_temp_wav);
     int rc = 0;
 
-    if (ref_text && strlen(ref_text) > 0) {
+    if (need_icl) {
         fprintf(stderr, "[*] Loading ICL prompt encoders from '%s'...\n", model_name);
         if (!qwen3_tts_load_icl_prompt_encoder_with_name(ctx, model_dir, model_name)) {
             fprintf(stderr, "[-] Error: Failed to load ICL prompt encoder\n");
@@ -1719,9 +2128,10 @@ int c_extract_profile(const char* audio_path, const char* ref_text, const char* 
             fprintf(stderr, "[+] Full ICL voice profile saved to: %s\n", output_profile_path);
         }
     } else {
+        // Fast speaker-encoder-only load (~7.5 MB instead of full 4.1 GB transformer + vocoder)
         fprintf(stderr, "[*] Loading speaker encoder from '%s'...\n", model_name);
-        if (!qwen3_tts_load_models_with_name(ctx, model_dir, model_name)) {
-            fprintf(stderr, "[-] Error: Failed to load model '%s'\n", model_name);
+        if (!qwen3_tts_load_speaker_encoder_with_name(ctx, model_dir, model_name)) {
+            fprintf(stderr, "[-] Error: Failed to load speaker encoder from '%s'\n", model_name);
             rc = 1;
         } else if (!qwen3_tts_extract_speaker_embedding(ctx, prepared_audio, output_profile_path)) {
             char* err = qwen3_tts_get_last_error(ctx);

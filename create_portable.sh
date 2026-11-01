@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # voicecli - Linux Standalone Single-Binary Portable Package Generator
-# Compiles a single, unified binary with statically embedded Multi-ISA GGML C++
-# engine (Baseline x86-64 SSE2 + SSE4.2 + AVX2/FMA/F16C + AVX-512 runtime CPU
-# dispatch) and packages it into a clean .tar.gz bundle for Linux (x86_64).
+# Compiles a single, unified binary with statically embedded 7-Tier Multi-ISA
+# GGML C++ engine (Baseline x86-64 SSE2 / SSE4.2 / AVX2 / AVX2-VNNI / AVX-512 /
+# AVX-512-VNNI / AVX-512-BF16 runtime CPU dispatch) and packages it into a clean
+# .tar.gz bundle for Linux (x86_64).
 # ==============================================================================
 
 set -euo pipefail
@@ -23,11 +24,13 @@ for cmd in cargo cmake curl tar git nm objcopy ranlib readelf; do
     fi
 done
 
-# 2. Ensure external/qwen3-tts is present
+# 2. Ensure external/qwen3-tts is present (pinned to verified upstream commit by build.rs)
 if [ ! -f "external/qwen3-tts/CMakeLists.txt" ]; then
     echo "[*] Cloning native qwen3-tts.cpp engine (with GGML submodules)..."
     mkdir -p external
-    git clone --depth 1 --recursive https://github.com/Danmoreng/qwen3-tts.cpp.git external/qwen3-tts
+    git clone https://github.com/Danmoreng/qwen3-tts.cpp.git external/qwen3-tts
+    git -C external/qwen3-tts checkout 16bb5afcd06311031c72a8488f8d59660dc2fb46
+    git -C external/qwen3-tts submodule update --init --recursive
 fi
 
 # 3. Enforce portable baseline x86-64 codegen for Rust unless VOICECLI_NATIVE=1
@@ -68,5 +71,5 @@ echo "============================================================"
 echo "[+] SUCCESS! Portable single-binary package created:"
 echo "    -> ${ARCHIVE_NAME}"
 echo "    Size: $(du -h "${ARCHIVE_NAME}" | cut -f1)"
-echo "    (Multi-ISA runtime CPU dispatch: x86-64 / SSE4.2 / AVX2 / AVX-512)"
+echo "    (7-Tier Multi-ISA runtime CPU dispatch: x64 / SSE4.2 / AVX2 / AVX2-VNNI / AVX-512 / AVX-512-VNNI / AVX-512-BF16)"
 echo "============================================================"

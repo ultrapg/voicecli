@@ -10,6 +10,37 @@
 
 ---
 
+## What's New in v0.4.0
+
+- **3.0x – 4.8x Faster End-to-End CPU Synthesis & Up to 98% Lower Peak RAM**:
+  - Re-engineered every stage of the local CPU inference stack (`ggml-cpu`, GGUF loader, Talker & Code Predictor transformers, 12Hz neural vocoder, ECAPA/RVQ encoders, BPE tokenizer, and Rust/C CLI) while preserving 100% GGUF model compatibility and audio synthesis quality.
+- **7-Tier Multi-ISA Runtime x86_64 Dispatch + ARM64 NEON (`build.rs`, `src/cpu_dispatch.c`)**:
+  - Embeds **seven** symbol-isolated GGML CPU backends inside a single portable executable (`AVX-512 BF16+VNNI+VBMI`, `AVX-512 VNNI+VBMI`, `AVX-512`, `AVX2+AVX-VNNI`, `AVX2+FMA+F16C`, `SSE4.2`, and universal `Baseline x86-64 SSE2`), plus ARM64 `NEON` / `dotprod` / `fp16` support.
+  - Enables `llamafile` `tinyBLAS` SGEMM, `GGML_CPU_REPACK` (`q4_K_8x8` / `q8_0_x8` SIMD interleaved weights), native low-latency `ggml_threadpool` (eliminating `libgomp.so` completely), and hardware SIMD `BF16` dot-product & conversion kernels across AVX-512-BF16, AVX-512BW, AVX2, SSE2, and NEON.
+- **Transformer, Vocoder, Encoder & Tokenizer Acceleration (`engine/`)**:
+  - **Zero-Copy `mmap` + Immediate Page Eviction**: Memory-maps GGUF weights directly and releases converted/repacked source pages via `POSIX_MADV_DONTNEED`, cutting Peak RSS by **650 – 1,380 MiB**.
+  - **Fused QKV & SwiGLU + 15-Step Code Predictor Supergraph**: Fuses attention Q/K/V and FFN Gate/Up projections, compacts `codec_head` from `3072` to `2056` rows, switches KV caches to `F16` with `ggml_flash_attn_ext`, and runs all 15 Code Predictor steps in a **single GGML supergraph** for **both greedy (`temperature=0.0`) and stochastic (`temperature>0`)** decoding on CPU.
+  - **Stateful Causal Tiled Vocoder + Fused SIMD `SnakeBeta` + L1-Tiled `im2col`**: Replaces monolithic ~700 MiB batch vocoder graphs with an L3-cache-friendly 16-frame stateful causal tiled pipeline, custom multi-threaded AVX-512/AVX2/SSE2/NEON `SnakeBeta` operator, and zero-false-sharing SIMD `im2col`.
+  - **Instant Metadata, BPE & Encoder Paths**: `<50 ms` header-only `speak --list-speakers` (`21.7 MB` RSS), `0.34 s` speaker-only `profile` (`87.7 MB` RSS), arena-backed flat BPE tokenizer, radix-2 FFT + sparse Mel frontend, 4-row SIMD RVQ codebook search, 512-phase polyphase sinc resampler, and AVX2/SSE2/NEON SOLA time-stretching.
+  - **Bug Fixes**: Fixed `-m tiny` mapping to `0.6b-q4`, stochastic `seed=-1` entropy per run, and `.bin` binary speaker profile loading (`speaker_embedding_io.cpp`).
+- **Real-Time 3-Phase Terminal Progress Bar (`src/model.c`)**:
+  - Displays true wall-clock synthesis progress across `Prefill -> Gen -> Vocode -> Done` with syllable/CJK/prosody frame estimation, model-calibrated + empirically-adapted vocode/gen wall-clock ratios, 29-step intra-tile `SnakeBeta` vocoder tracking, live `RT` speed & `ETA`, and 50 ms vDSO `clock_gettime` throttling (~0.00% CPU overhead, <=75 cols for zero 80-col line wrapping).
+
+### Measured CPU Speedup & Memory Reduction (`v0.3.1` vs `v0.4.0`, 2-Core CPU)
+
+| Workload | `v0.3.1` Wall | `v0.4.0` Wall | Speedup | `v0.3.1` Peak RSS | `v0.4.0` Peak RSS | RAM Saved |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| `speak --list-speakers -m 0.6b-q4` | 2.09 s | **0.05 s** | **43.5x** | 1,100 MiB | **22 MiB** | **-98%** |
+| `profile -m fast` (`.bin` speaker) | 3.18 s | **0.34 s** | **9.3x** | 1,471 MiB | **88 MiB** | **-94%** |
+| `speak -m tiny` (`0.6B Q4_K_M`, default `t=0.9`) | 40.41 s | **8.41 s** | **4.80x** | 1,548 MiB | **830 MiB** | **-46%** |
+| `speak -m 0.6b-q4` (`0.6B Q4_K_M`, greedy) | 36.00 s | **10.03 s** | **3.59x** | 1,491 MiB | **833 MiB** | **-44%** |
+| `speak -m q4` (`1.7B Q4_K_M`, greedy) | 56.49 s | **18.02 s** | **3.13x** | 2,232 MiB | **1,383 MiB** | **-38%** |
+| `clone -m fast --ref-text` (`0.6B Q8_0` Full-ICL) | 45.13 s | **14.42 s** | **3.13x** | 2,236 MiB | **1,398 MiB** | **-38%** |
+| `clone -m fast` (`0.6B Q8_0` Zero-Shot) | 39.94 s | **13.28 s** | **3.01x** | 1,934 MiB | **1,172 MiB** | **-39%** |
+| `speak -m 0.6b-bf16` (`0.6B BF16`, greedy) | 45.16 s | **15.33 s** | **2.95x** | 2,658 MiB | **1,631 MiB** | **-39%** |
+
+---
+
 ## What's New in v0.3.1
 
 - **Fixed `SIGILL` (`Illegal instruction` / `Ungültiger Maschinenbefehl`) Crash on Non-AVX-512 CPUs**:
@@ -74,19 +105,19 @@
 
 `voicecli` is a high-performance command-line interface for **Qwen3-TTS**, Alibaba Cloud's state-of-the-art text-to-speech and voice-cloning model family.
 
-The entire PyTorch and Python stack has been eliminated. The inference core is built directly on native C/C++ utilizing **GGML** tensor primitives with runtime-dispatched hardware SIMD instructions (AVX-512, AVX2 + FMA + F16C, SSE4.2, Baseline SSE2, NEON). The result is a single, self-contained executable (~5.7 MB) that runs on any 64-bit Linux x86_64 CPU without installing Python or deep learning frameworks.
+The entire PyTorch and Python stack has been eliminated. The inference core is built directly on native C/C++ utilizing **GGML** tensor primitives with 7-tier runtime-dispatched hardware SIMD instructions (`AVX-512 BF16`, `AVX-512 VNNI`, `AVX-512`, `AVX2-VNNI`, `AVX2 + FMA + F16C`, `SSE4.2`, `Baseline SSE2`, and ARM64 `NEON`). The result is a single, self-contained executable (~9.3 MB, zero `libgomp` or external `.so` dependencies) that runs at peak hardware speed on any 64-bit CPU without installing Python or deep learning frameworks.
 
 ---
 
 ## The Re-Engineering: Python / PyTorch vs. Native GGML
 
-| Metric / Feature | Original Python / PyTorch Implementation | Native Single-Binary Architecture (`v0.3.1`) |
+| Metric / Feature | Original Python / PyTorch Implementation | Native Single-Binary Architecture (`v0.4.0`) |
 | :--- | :--- | :--- |
-| **Runtime Dependencies** | Python 3.11, PyTorch, Torchaudio, Transformers, PyO3, LibCUDA | **None** (Statically linked single binary) |
-| **Distribution Package Size** | Multi-GB folder or complex virtualenv bundle | **~2.5 MB** (`voicecli-linux-x86_64.tar.gz`) |
-| **Binary Executable Size** | Fragile wrapper DLLs + hundreds of shared `.so` files | **~5.7 MB single unified multi-ISA binary** |
-| **Cold-Start Time** | 10 – 20+ seconds (Python interpreter + PyTorch init) | **Sub-second startup** + direct model memory mapping |
-| **Hardware Acceleration** | Requires CUDA GPU or heavy PyTorch CPU backend | **Multi-ISA Runtime CPU Dispatch (`x86-64` / `SSE4.2` / `AVX2` / `AVX-512`)** |
+| **Runtime Dependencies** | Python 3.11, PyTorch, Torchaudio, Transformers, PyO3, LibCUDA | **None** (Zero OpenMP / `.so` plugins; standard libc/libstdc++ only) |
+| **Distribution Package Size** | Multi-GB folder or complex virtualenv bundle | **~3.9 MB** (`voicecli-linux-x86_64.tar.gz`) |
+| **Binary Executable Size** | Fragile wrapper DLLs + hundreds of shared `.so` files | **~9.3 MB single unified 7-ISA binary** |
+| **Cold-Start Time** | 10 – 20+ seconds (Python interpreter + PyTorch init) | **Sub-second startup** + zero-copy `mmap` weight loading |
+| **Hardware Acceleration** | Requires CUDA GPU or heavy PyTorch CPU backend | **7-Tier Runtime CPU Dispatch (`SSE2` -> `SSE4.2` -> `AVX2` -> `AVX2-VNNI` -> `AVX-512` -> `AVX-512-VNNI` -> `AVX-512-BF16`) + `tinyBLAS` + `CPU_REPACK`** |
 | **Model Support** | Single precision only | **BF16, Q8_0, Q4_K_M (1.7B & 0.6B presets)** |
 | **Voice Cloning Modes** | Basic speaker embedding | **Speaker Embedding + Full In-Context Learning (ICL) + Cached Profiles** |
 | **Audio Writing Pipeline** | `scipy.io.wavfile` / `soundfile` / `torchaudio` | **64 KB buffered native 24 kHz 16-bit PCM WAV writer + stdout piping** |
@@ -304,6 +335,7 @@ Pass `--model <PRESET>` (`-m`) to select any preset on the fly:
 | **`bf16`** *(default)* | `qwen-talker-1.7b-voicedesign-BF16.gguf` | `qwen-talker-1.7b-base-BF16.gguf` | `qwen-talker-1.7b-customvoice-BF16.gguf` | ~3.8 GB |
 | **`q8`** | `qwen-talker-1.7b-voicedesign-Q8_0.gguf` | `qwen-talker-1.7b-base-Q8_0.gguf` | `qwen-talker-1.7b-customvoice-Q8_0.gguf` | ~2.1 GB |
 | **`q4`** | `qwen-talker-1.7b-voicedesign-Q4_K_M.gguf` | `qwen-talker-1.7b-base-Q4_K_M.gguf` | `qwen-talker-1.7b-customvoice-Q4_K_M.gguf` | ~1.3 GB |
+| **`0.6b-bf16`** | `qwen-talker-1.7b-voicedesign-BF16.gguf` | `qwen-talker-0.6b-base-BF16.gguf` | `qwen-talker-0.6b-customvoice-BF16.gguf` | ~1.7 GB |
 | **`0.6b` / `fast`** | `qwen-talker-1.7b-voicedesign-Q8_0.gguf` | `qwen-talker-0.6b-base-Q8_0.gguf` | `qwen-talker-0.6b-customvoice-Q8_0.gguf` | ~0.9 GB |
 | **`0.6b-q4` / `tiny`**| `qwen-talker-1.7b-voicedesign-Q4_K_M.gguf` | `qwen-talker-0.6b-base-Q4_K_M.gguf` | `qwen-talker-0.6b-customvoice-Q4_K_M.gguf` | ~0.6 GB |
 
